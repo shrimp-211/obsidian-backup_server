@@ -291,6 +291,83 @@ impl BlockIndex {
 
         Ok(chunks)
     }
+
+    /// Decrement reference count for a chunk (used during rollback).
+    pub fn decrement_ref(&self, chunk_hash: &str) -> Result<u64> {
+        let cf = self
+            .db
+            .cf_handle(CF_CHUNK_REFS)
+            .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_CHUNK_REFS))?;
+
+        let current = match self.db.get_cf(&cf, chunk_hash.as_bytes())? {
+            Some(data) if data.len() == 8 => u64::from_le_bytes(data[..8].try_into().unwrap()),
+            _ => 0,
+        };
+
+        let new = current.saturating_sub(1);
+        if new > 0 {
+            self.db
+                .put_cf(&cf, chunk_hash.as_bytes(), &new.to_le_bytes())?;
+        } else {
+            self.db.delete_cf(&cf, chunk_hash.as_bytes())?;
+        }
+
+        Ok(new)
+    }
+
+    /// Get the reference count for a chunk (for testing).
+    pub fn get_ref_count(&self, chunk_hash: &str) -> Result<u64> {
+        let cf = self
+            .db
+            .cf_handle(CF_CHUNK_REFS)
+            .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_CHUNK_REFS))?;
+
+        match self.db.get_cf(&cf, chunk_hash.as_bytes())? {
+            Some(data) if data.len() == 8 => Ok(u64::from_le_bytes(data[..8].try_into().unwrap())),
+            _ => Ok(0),
+        }
+    }
+
+    /// Flush the RocksDB Write-Ahead Log to disk.
+    ///
+    /// This is the critical durability guarantee — after this call,
+    /// all committed data survives a process crash.
+    pub fn flush_wal(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
+        info!("[RocksDB] WAL flushed to disk");
+        Ok(())
+    }
+
+    /// Store per-snapshot file metadata for accurate diff comparison.
+    pub fn insert_snapshot_files(&self, snapshot_id: &str, files: &[String]) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_SNAPSHOT)
+            .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_SNAPSHOT))?;
+
+        let json = serde_json::to_string(files)?;
+        self.db
+            .put_cf(&cf, snapshot_id.as_bytes(), json.as_bytes())?;
+        Ok(())
+    }
+
+    /// Get all snapshot IDs from the index.
+    pub fn get_all_snapshot_ids(&self) -> Result<Vec<String>> {
+        let cf = self
+            .db
+            .cf_handle(CF_SNAPSHOT)
+            .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_SNAPSHOT))?;
+
+        let mut ids = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            if let Ok(id) = String::from_utf8(key.to_vec()) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
 }
 
 #[cfg(test)]
@@ -322,8 +399,18 @@ mod tests {
             .unwrap();
         assert!(idx.chunk_exists("abc123").unwrap());
 
+        // After insert, ref count should be 1
+        assert_eq!(idx.get_ref_count("abc123").unwrap(), 1);
+
         idx.increment_ref("abc123").unwrap();
-        // Reference count should now be 2
-        // (1 from insert_chunk + 1 from increment_ref)
+        // After increment, ref count should be 2
+        assert_eq!(idx.get_ref_count("abc123").unwrap(), 2);
+
+        // Decrement should bring it back to 1
+        assert_eq!(idx.decrement_ref("abc123").unwrap(), 1);
+
+        // Decrement again should remove the entry (count = 0)
+        assert_eq!(idx.decrement_ref("abc123").unwrap(), 0);
+        assert!(!idx.chunk_exists("abc123").unwrap());
     }
 }

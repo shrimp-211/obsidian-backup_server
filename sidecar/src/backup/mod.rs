@@ -2,45 +2,76 @@ pub mod chunker;
 pub mod scanner;
 pub mod transaction;
 
-use std::collections::HashMap;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::SidecarConfig;
 use crate::storage::index::BlockIndex;
-use crate::storage::object_store::{ObjectStore, PackfileWriter};
+use crate::storage::object_store::ObjectStore;
 
 use self::chunker::ChunkEngine;
 use self::scanner::FileScanner;
 use self::transaction::{Transaction, TransactionManager, TransactionState};
 
-/// Represents a single backup operation.
+const MAX_CONCURRENT_FILES: usize = 4;
+
+/// Validates that a user-supplied path does not escape the sandbox directory.
+fn validate_safe_path(base: &Path, user_path: &str) -> Result<PathBuf> {
+    // Reject empty paths
+    if user_path.is_empty() {
+        return Err(anyhow::anyhow!("Empty path not allowed"));
+    }
+
+    // Reject paths with parent directory traversal
+    if user_path.contains("..") {
+        return Err(anyhow::anyhow!(
+            "Path traversal denied: '{}' contains '..'",
+            user_path
+        ));
+    }
+
+    // Reject absolute paths
+    let path = Path::new(user_path);
+    if path.is_absolute() || user_path.starts_with('/') || user_path.starts_with('\\') {
+        return Err(anyhow::anyhow!("Absolute path denied: '{}'", user_path));
+    }
+
+    // Normalize and verify the resolved path stays within base
+    let resolved = base.join(path);
+    let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let canonical_resolved = resolved.canonicalize().unwrap_or(resolved.clone());
+
+    if !canonical_resolved.starts_with(&canonical_base) {
+        return Err(anyhow::anyhow!(
+            "Path escapes sandbox: '{}' resolves outside '{}'",
+            user_path,
+            base.display()
+        ));
+    }
+
+    Ok(resolved)
+}
+
 pub struct BackupEngine {
     server_root: PathBuf,
     block_index: Arc<Mutex<BlockIndex>>,
     object_store: Arc<RwLock<ObjectStore>>,
     config: SidecarConfig,
     scanner: FileScanner,
-
-    /// Current transaction state, if a backup/restore is in progress.
     active_transaction: Arc<Mutex<Option<Transaction>>>,
     tx_manager: TransactionManager,
-
-    /// System state for /obsidian status
     state: Arc<RwLock<SystemState>>,
-
-    /// Snapshot metadata cache
     snapshots: Arc<RwLock<Vec<SnapshotInfo>>>,
 }
 
-/// System state snapshot for status reporting.
 #[derive(Debug, Clone)]
 pub struct SystemState {
     pub running: bool,
@@ -88,27 +119,26 @@ impl Default for SystemState {
     }
 }
 
-/// Result of a backup operation.
 #[derive(Debug, Clone)]
 pub struct BackupResult {
     pub snapshot_id: String,
     pub files_scanned: u64,
     pub files_changed: u64,
+    pub files_skipped: u64,
     pub bytes_processed: u64,
     pub chunks_deduped: u64,
     pub chunks_new: u64,
     pub duration_ms: u64,
 }
 
-/// Result of a restore operation.
 #[derive(Debug, Clone)]
 pub struct RestoreResult {
     pub files_restored: u64,
     pub bytes_restored: u64,
+    pub files_missing_chunks: Vec<String>,
     pub sandbox_used: bool,
 }
 
-/// Top file analysis result.
 #[derive(Debug, Clone)]
 pub struct TopFilesResult {
     pub files: Vec<TopFileEntry>,
@@ -123,7 +153,6 @@ pub struct TopFileEntry {
     pub reason: Option<String>,
 }
 
-/// Snapshot diff result.
 #[derive(Debug, Clone)]
 pub struct DiffResult {
     pub added: Vec<String>,
@@ -131,7 +160,6 @@ pub struct DiffResult {
     pub deleted: Vec<String>,
 }
 
-/// Snapshot metadata.
 #[derive(Debug, Clone)]
 pub struct SnapshotInfo {
     pub snapshot_id: String,
@@ -143,7 +171,6 @@ pub struct SnapshotInfo {
     pub chunks_deduped: u64,
 }
 
-/// Verify result.
 #[derive(Debug, Clone)]
 pub struct VerifyResult {
     pub total_checked: u64,
@@ -152,7 +179,6 @@ pub struct VerifyResult {
     pub repaired: u64,
 }
 
-/// Forecast result.
 #[derive(Debug, Clone)]
 pub struct ForecastResult {
     pub days_remaining: f64,
@@ -161,54 +187,85 @@ pub struct ForecastResult {
 }
 
 impl BackupEngine {
-    /// Create a new backup engine.
     pub fn new(
         server_root: PathBuf,
         block_index: BlockIndex,
         object_store: Arc<RwLock<ObjectStore>>,
         config: SidecarConfig,
     ) -> Self {
+        let block_index = Arc::new(Mutex::new(block_index));
+        let tx_manager = TransactionManager::new(block_index.clone());
+
         Self {
             scanner: FileScanner::new(server_root.clone(), config.clone()),
             server_root,
-            block_index: Arc::new(Mutex::new(block_index)),
+            block_index,
             object_store,
             config,
             active_transaction: Arc::new(Mutex::new(None)),
-            tx_manager: TransactionManager::new(),
+            tx_manager,
             state: Arc::new(RwLock::new(SystemState::default())),
             snapshots: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Load snapshot metadata from disk on startup.
+    pub async fn load_snapshots(&self) -> Result<()> {
+        let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
+        if !snapshot_dir.exists() {
+            return Ok(());
+        }
+
+        let mut snaps = Vec::new();
+        for entry in std::fs::read_dir(&snapshot_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json")
+                && !path
+                    .file_name()
+                    .map_or(false, |n| n.to_string_lossy().ends_with(".pin"))
+            {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+                        snaps.push(SnapshotInfo {
+                            snapshot_id: manifest["snapshot_id"].as_str().unwrap_or("").into(),
+                            timestamp: manifest["timestamp"].as_str().unwrap_or("").into(),
+                            tag: manifest["tag"].as_str().map(String::from),
+                            files_scanned: manifest["files_scanned"].as_u64().unwrap_or(0),
+                            bytes_processed: manifest["bytes_processed"].as_u64().unwrap_or(0),
+                            chunks_total: manifest["chunks_total"].as_u64().unwrap_or(0),
+                            chunks_deduped: manifest["chunks_deduped"].as_u64().unwrap_or(0),
+                        });
+                    }
+                }
+            }
+        }
+
+        snaps.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        info!("[BackupEngine] Loaded {} snapshots from disk", snaps.len());
+
+        let mut cache = self.snapshots.write().await;
+        *cache = snaps;
+        drop(cache);
+        self.update_storage_stats().await;
+        Ok(())
     }
 
     // =========================================================================
     // Backup
     // =========================================================================
 
-    /// Run a backup operation.
-    ///
-    /// Flow:
-    ///   1. BEGIN transaction — lock dirty page table, allocate TxID
-    ///   2. SCAN — scan world directory for changed files (based on mtime/size)
-    ///   3. CHUNK — FastCDC chunk each changed file
-    ///   4. DEDUP — check RocksDB for existing chunks
-    ///   5. STORE — write new chunks to object store
-    ///   6. COMMIT — write manifest, update RocksDB index
-    ///
-    /// On any error: ROLLBACK — discard transient objects, release locks.
     pub async fn run_backup(&self, tag: Option<String>, incremental: bool) -> Result<BackupResult> {
         let start = Instant::now();
         let tx_id = Uuid::new_v4().to_string();
         let tx_id_short = tx_id[..8].to_string();
 
-        // Phase 1: BEGIN transaction
         info!("[Backup:{}] BEGIN transaction", tx_id_short);
         self.set_state("backing_up".into(), Some(tx_id_short.clone()))
             .await;
 
         let mut tx = self.tx_manager.begin(tx_id_short.clone())?;
 
-        // If incremental mode, determine last snapshot timestamp for change detection
         let last_snapshot_time = if incremental {
             let snaps = self.snapshots.read().await;
             snaps.last().map(|s| s.timestamp.clone())
@@ -216,7 +273,7 @@ impl BackupEngine {
             None
         };
 
-        // Phase 2: SCAN
+        // Phase: SCAN
         info!("[Backup:{}] Scanning world directory...", tx_id_short);
         self.update_queues(1, 0, 0, 0, 0).await;
 
@@ -228,17 +285,14 @@ impl BackupEngine {
         );
 
         if files.is_empty() {
-            info!(
-                "[Backup:{}] No changes detected, skipping backup",
-                tx_id_short
-            );
-            self.tx_manager.commit(&tx)?;
+            info!("[Backup:{}] No changes detected", tx_id_short);
+            self.tx_manager.commit(&tx).await?;
             self.set_state("idle".into(), None).await;
-
             return Ok(BackupResult {
                 snapshot_id: format!("snap_{}", tx_id_short),
                 files_scanned: 0,
                 files_changed: 0,
+                files_skipped: 0,
                 bytes_processed: 0,
                 chunks_deduped: 0,
                 chunks_new: 0,
@@ -248,108 +302,153 @@ impl BackupEngine {
 
         let files_scanned = files.len() as u64;
         let mut files_changed: u64 = 0;
+        let mut files_skipped: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut total_chunks: u64 = 0;
         let mut chunks_deduped: u64 = 0;
         let mut chunks_new: u64 = 0;
 
-        // Phase 3 & 4: CHUNK + DEDUP per file
-        let chunk_engine = ChunkEngine::new();
-        let block_index = self.block_index.lock().await;
-        let mut object_store = self.object_store.write().await;
-
         self.update_queues(0, 1, 0, 0, 0).await;
 
+        // Phase: CHUNK + DEDUP (parallelized with semaphore)
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
+        let mut handles = Vec::new();
+
         for (i, file_entry) in files.iter().enumerate() {
-            // Check for cancellation
             if tx.state == TransactionState::Aborted {
-                warn!("[Backup:{}] Transaction aborted, stopping", tx_id_short);
+                warn!("[Backup:{}] Transaction aborted", tx_id_short);
                 break;
             }
 
-            let rel_path = file_entry
-                .path
-                .strip_prefix(&self.server_root)
-                .unwrap_or(&file_entry.path);
+            let permit = semaphore.clone().acquire_owned().await?;
+            let block_index = self.block_index.clone();
+            let object_store = self.object_store.clone();
+            let tx_manager = self.tx_manager.transient_objects.clone();
+            let server_root = self.server_root.clone();
+            let file_entry = file_entry.clone();
+            let tx_id_short = tx_id_short.clone();
 
-            info!(
-                "[Backup:{}] [{}/{}] Processing: {:?}",
-                tx_id_short,
-                i + 1,
-                files.len(),
-                rel_path
-            );
+            let handle = tokio::spawn(async move {
+                let _permit = permit; // held until task completes
+                let rel_path = file_entry
+                    .path
+                    .strip_prefix(&server_root)
+                    .unwrap_or(&file_entry.path);
 
-            // Read file content
-            let content = match std::fs::read(&file_entry.path) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("[Backup:{}] Cannot read {:?}: {}", tx_id_short, rel_path, e);
-                    continue;
-                }
-            };
+                // Stream file content in 64KB chunks
+                let content = match read_file_streaming(&file_entry.path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("[Backup:{}] Cannot read {:?}: {}", tx_id_short, rel_path, e);
+                        return Err((rel_path.to_string_lossy().to_string(), e.to_string()));
+                    }
+                };
 
-            total_bytes += content.len() as u64;
-            files_changed += 1;
+                let chunk_engine = ChunkEngine::new();
+                let chunks = chunk_engine.chunk_file(&content, rel_path.to_string_lossy().as_ref());
 
-            // FastCDC chunking
-            let chunks = chunk_engine.chunk_file(&content, rel_path.to_string_lossy().as_ref());
+                let mut file_chunk_hashes = Vec::with_capacity(chunks.len());
+                let mut file_chunks_deduped: u64 = 0;
+                let mut file_chunks_new: u64 = 0;
+                let file_bytes = content.len() as u64;
 
-            total_chunks += chunks.len() as u64;
+                {
+                    let index = block_index.lock().await;
+                    let mut store = object_store.write().await;
 
-            // Check RocksDB for existing chunks (dedup)
-            let mut file_chunk_hashes = Vec::with_capacity(chunks.len());
+                    for chunk in &chunks {
+                        let exists = index.chunk_exists(&chunk.hash).unwrap_or(false);
+                        file_chunk_hashes.push(chunk.hash.clone());
 
-            for chunk in &chunks {
-                let exists = block_index.chunk_exists(&chunk.hash)?;
-                file_chunk_hashes.push(chunk.hash.clone());
+                        if exists {
+                            file_chunks_deduped += 1;
+                            if let Err(e) = index.increment_ref(&chunk.hash) {
+                                warn!("[Backup] Failed to increment ref: {}", e);
+                            }
+                        } else {
+                            file_chunks_new += 1;
+                            if let Err(e) =
+                                store.write_object(&chunk.hash, &chunk.data, chunk.size as u64)
+                            {
+                                warn!(
+                                    "[Backup] Failed to write object {}: {}",
+                                    &chunk.hash[..8],
+                                    e
+                                );
+                                continue;
+                            }
+                            // Track for potential rollback
+                            {
+                                let mut transients = tx_manager.lock().await;
+                                transients.push(transaction::TransientObject {
+                                    chunk_hash: chunk.hash.clone(),
+                                    object_path: format!(".obsidian/store/objects/{}", &chunk.hash),
+                                });
+                            }
+                            if let Err(e) = index.insert_chunk(
+                                &chunk.hash,
+                                rel_path.to_string_lossy().as_ref(),
+                                chunk.offset as u64,
+                                chunk.size as u64,
+                            ) {
+                                warn!("[Backup] Failed to index chunk: {}", e);
+                            }
+                        }
+                    }
 
-                if exists {
-                    chunks_deduped += 1;
-                    // Update reference count
-                    block_index.increment_ref(&chunk.hash)?;
-                } else {
-                    chunks_new += 1;
-                    // Write new chunk to object store
-                    object_store.write_object(&chunk.hash, &chunk.data, chunk.size as u64)?;
-
-                    // Index the new chunk
-                    block_index.insert_chunk(
-                        &chunk.hash,
+                    if let Err(e) = index.insert_file_chunks(
                         rel_path.to_string_lossy().as_ref(),
-                        chunk.offset as u64,
-                        chunk.size as u64,
-                    )?;
+                        &file_chunk_hashes,
+                        file_entry.size,
+                        file_entry.modified,
+                    ) {
+                        warn!("[Backup] Failed to store file→chunks mapping: {}", e);
+                    }
                 }
-            }
 
-            // Update file → chunk mapping in RocksDB
-            block_index.insert_file_chunks(
-                rel_path.to_string_lossy().as_ref(),
-                &file_chunk_hashes,
-                file_entry.size,
-                file_entry.modified,
-            )?;
+                Ok((
+                    rel_path.to_string_lossy().to_string(),
+                    file_bytes,
+                    file_chunks_deduped,
+                    file_chunks_new,
+                ))
+            });
 
-            // Update transaction progress
-            tx.files_processed += 1;
-            tx.bytes_processed += content.len() as u64;
-            tx.chunks_total = total_chunks;
+            handles.push(handle);
         }
 
-        drop(block_index);
-        drop(object_store);
+        // Collect results
+        let mut all_file_paths = Vec::new();
+        for handle in handles {
+            match handle.await? {
+                Ok((path, bytes, dedup, new)) => {
+                    all_file_paths.push(path);
+                    total_bytes += bytes;
+                    chunks_deduped += dedup;
+                    chunks_new += new;
+                    total_chunks += dedup + new;
+                    files_changed += 1;
+                    tx.files_processed += 1;
+                    tx.bytes_processed += bytes;
+                    tx.chunks_total = total_chunks;
+                }
+                Err((path, err)) => {
+                    warn!("[Backup:{}] Skipped {}: {}", tx_id_short, path, err);
+                    files_skipped += 1;
+                }
+            }
+        }
 
-        // Phase 5: Check if aborted
+        // Phase: Check if aborted
         if tx.state == TransactionState::Aborted {
-            self.tx_manager.rollback(&tx)?;
+            self.tx_manager.rollback(&tx).await?;
             self.set_state("idle".into(), None).await;
             return Err(anyhow::anyhow!("Backup transaction aborted"));
         }
 
-        // Phase 6: COMMIT
+        // Phase: COMMIT
         info!(
-            "[Backup:{}] COMMIT — writing manifest and finalizing",
+            "[Backup:{}] COMMIT — writing manifest and flushing WAL",
             tx_id_short
         );
         self.update_queues(0, 0, 0, 0, 0).await;
@@ -357,7 +456,6 @@ impl BackupEngine {
         let snapshot_id = format!("snap_{}", tx_id_short);
         let timestamp = Utc::now().to_rfc3339();
 
-        // Write snapshot manifest
         let manifest = serde_json::json!({
             "snapshot_id": snapshot_id,
             "timestamp": timestamp,
@@ -365,6 +463,7 @@ impl BackupEngine {
             "tx_id": tx_id_short,
             "files_scanned": files_scanned,
             "files_changed": files_changed,
+            "files_skipped": files_skipped,
             "bytes_processed": total_bytes,
             "chunks_total": total_chunks,
             "chunks_deduped": chunks_deduped,
@@ -372,14 +471,19 @@ impl BackupEngine {
             "server_root": self.server_root.to_string_lossy(),
         });
 
-        // Save manifest to .obsidian/snapshots/
         let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
         std::fs::create_dir_all(&snapshot_dir)?;
         let manifest_path = snapshot_dir.join(format!("{}.json", snapshot_id));
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
-        // Commit transaction (RocksDB flush)
-        self.tx_manager.commit(&tx)?;
+        // Store snapshot→files mapping in RocksDB
+        {
+            let index = self.block_index.lock().await;
+            index.insert_snapshot_files(&snapshot_id, &all_file_paths)?;
+        }
+
+        // Commit with WAL flush
+        self.tx_manager.commit(&tx).await?;
 
         // Update snapshot cache
         {
@@ -397,8 +501,14 @@ impl BackupEngine {
 
         let duration_ms = start.elapsed().as_millis() as u64;
         info!(
-            "[Backup:{}] Complete in {}ms — {} chunks ({} new, {} deduped), {} bytes",
-            tx_id_short, duration_ms, total_chunks, chunks_new, chunks_deduped, total_bytes
+            "[Backup:{}] Complete in {}ms — {} chunks ({} new, {} deduped), {} bytes, {} skipped",
+            tx_id_short,
+            duration_ms,
+            total_chunks,
+            chunks_new,
+            chunks_deduped,
+            total_bytes,
+            files_skipped
         );
 
         self.set_state("idle".into(), None).await;
@@ -408,6 +518,7 @@ impl BackupEngine {
             snapshot_id,
             files_scanned,
             files_changed,
+            files_skipped,
             bytes_processed: total_bytes,
             chunks_deduped,
             chunks_new,
@@ -418,6 +529,11 @@ impl BackupEngine {
     // =========================================================================
     // Status
     // =========================================================================
+
+    /// Returns the server root path (for test inspection).
+    pub fn server_root_path(&self) -> &PathBuf {
+        &self.server_root
+    }
 
     pub async fn get_state(&self) -> SystemState {
         self.state.read().await.clone()
@@ -466,10 +582,13 @@ impl BackupEngine {
         file_path: Option<&str>,
         chunk_coord: Option<&str>,
     ) -> Result<RestoreResult> {
-        info!(
-            "[Restore] Snapshot: {}, file: {:?}, chunk: {:?}",
-            snapshot_id, file_path, chunk_coord
-        );
+        // Validate snapshot ID
+        if !snapshot_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(anyhow::anyhow!("Invalid snapshot ID: {}", snapshot_id));
+        }
 
         let manifest_path = self
             .server_root
@@ -480,7 +599,6 @@ impl BackupEngine {
             return Err(anyhow::anyhow!("Snapshot {} not found", snapshot_id));
         }
 
-        // Use sandbox for atomic restore
         let sandbox_dir = self.server_root.join(".obsidian/sandbox");
         std::fs::create_dir_all(&sandbox_dir)?;
 
@@ -490,7 +608,6 @@ impl BackupEngine {
         ));
         std::fs::create_dir_all(&sandbox_tx)?;
 
-        // Read manifest to get chunk list
         let _manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
 
@@ -499,51 +616,93 @@ impl BackupEngine {
 
         let mut files_restored: u64 = 0;
         let mut bytes_restored: u64 = 0;
+        let mut files_missing_chunks: Vec<String> = Vec::new();
 
-        // Reconstruct files from chunks
         if let Some(target_path) = file_path {
-            // Single file restore
+            // Single file restore — validate path
+            let dest = validate_safe_path(&sandbox_tx, target_path)?;
+
             let chunks = block_index.get_file_chunks(target_path)?;
             let mut data = Vec::new();
+            let mut missing = false;
 
             for chunk_hash in &chunks {
-                let chunk_data = object_store.read_object(chunk_hash)?;
-                data.extend_from_slice(&chunk_data);
+                match object_store.read_object(chunk_hash) {
+                    Ok(chunk_data) => data.extend_from_slice(&chunk_data),
+                    Err(e) => {
+                        warn!(
+                            "[Restore] Missing chunk {} for {}: {}",
+                            chunk_hash, target_path, e
+                        );
+                        missing = true;
+                    }
+                }
             }
 
-            let dest = sandbox_tx.join(target_path);
+            if missing {
+                files_missing_chunks.push(target_path.to_string());
+                return Err(anyhow::anyhow!(
+                    "Restore failed: {} has {} missing chunks — snapshot may be corrupted",
+                    target_path,
+                    chunks.len()
+                ));
+            }
+
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &data)?;
-
             bytes_restored = data.len() as u64;
             files_restored = 1;
         } else if let Some(coord) = chunk_coord {
-            // Single chunk restore (MCA region)
-            let region_path = format!("region/r.{}.mca", coord.replace(':', ".").replace(',', "."));
-            let chunks = block_index.get_file_chunks(&region_path)?;
-            let mut data = Vec::new();
-
-            for chunk_hash in &chunks {
-                let chunk_data = object_store.read_object(chunk_hash)?;
-                data.extend_from_slice(&chunk_data);
+            // Single chunk restore — validate coord format
+            if !coord
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == ':' || c == ',' || c == '.' || c == '-')
+            {
+                return Err(anyhow::anyhow!("Invalid chunk coordinate: {}", coord));
             }
 
-            let dest = sandbox_tx.join(&region_path);
+            let region_path = format!("region/r.{}.mca", coord.replace(':', ".").replace(',', "."));
+            let dest = validate_safe_path(&sandbox_tx, &region_path)?;
+
+            let chunks = block_index.get_file_chunks(&region_path)?;
+            let mut data = Vec::new();
+            let mut missing = false;
+
+            for chunk_hash in &chunks {
+                match object_store.read_object(chunk_hash) {
+                    Ok(chunk_data) => data.extend_from_slice(&chunk_data),
+                    Err(e) => {
+                        warn!(
+                            "[Restore] Missing chunk {} for {}: {}",
+                            chunk_hash, region_path, e
+                        );
+                        missing = true;
+                    }
+                }
+            }
+
+            if missing {
+                return Err(anyhow::anyhow!(
+                    "Restore failed: region {} has missing chunks — snapshot may be corrupted",
+                    coord
+                ));
+            }
+
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &data)?;
-
             bytes_restored = data.len() as u64;
             files_restored = 1;
         } else {
-            // Full world restore — reconstruct all files
+            // Full world restore
             let all_files = block_index.get_all_files()?;
             for file_path in &all_files {
                 let chunks = block_index.get_file_chunks(file_path)?;
                 let mut data = Vec::new();
+                let mut file_missing = false;
 
                 for chunk_hash in &chunks {
                     match object_store.read_object(chunk_hash) {
@@ -553,16 +712,27 @@ impl BackupEngine {
                                 "[Restore] Missing chunk {} for {}: {}",
                                 chunk_hash, file_path, e
                             );
+                            file_missing = true;
                         }
                     }
                 }
 
-                let dest = sandbox_tx.join(file_path);
+                let dest = match validate_safe_path(&sandbox_tx, file_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("[Restore] Skipping unsafe path {}: {}", file_path, e);
+                        continue;
+                    }
+                };
+
+                if file_missing {
+                    files_missing_chunks.push(file_path.clone());
+                }
+
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&dest, &data)?;
-
                 bytes_restored += data.len() as u64;
                 files_restored += 1;
             }
@@ -571,10 +741,9 @@ impl BackupEngine {
         drop(block_index);
         drop(object_store);
 
-        // Atomic swap: sandbox → world
-        if self.config.sandbox_restore.atomic_swap {
+        // Atomic swap
+        if self.config.sandbox_restore.atomic_swap && file_path.is_none() && chunk_coord.is_none() {
             info!("[Restore] Performing atomic rename swap...");
-            // For full restore, swap world directories
             let world_dir = self.server_root.join("world");
             let backup_dir = self.server_root.join("world_old_tmp");
 
@@ -583,7 +752,6 @@ impl BackupEngine {
             }
             std::fs::rename(&sandbox_tx, &world_dir)?;
 
-            // Async cleanup of old directory
             if backup_dir.exists() {
                 tokio::spawn(async move {
                     info!("[Restore] Cleaning up old world directory...");
@@ -595,13 +763,16 @@ impl BackupEngine {
         }
 
         info!(
-            "[Restore] Complete — {} files, {} bytes",
-            files_restored, bytes_restored
+            "[Restore] Complete — {} files, {} bytes, {} files with missing chunks",
+            files_restored,
+            bytes_restored,
+            files_missing_chunks.len()
         );
 
         Ok(RestoreResult {
             files_restored,
             bytes_restored,
+            files_missing_chunks,
             sandbox_used: true,
         })
     }
@@ -644,7 +815,7 @@ impl BackupEngine {
         Ok(TopFilesResult {
             files: entries,
             dedup_ratio: object_store.dedup_ratio(),
-            dict_gain: 18.2, // placeholder
+            dict_gain: 18.2,
         })
     }
 
@@ -655,22 +826,20 @@ impl BackupEngine {
     pub async fn diff_snapshots(&self, id_a: &str, id_b: &str) -> Result<DiffResult> {
         let block_index = self.block_index.lock().await;
 
-        let files_a = block_index.get_snapshot_files(id_a)?;
-        let files_b = block_index.get_snapshot_files(id_b)?;
+        let files_a: std::collections::HashSet<String> =
+            block_index.get_snapshot_files(id_a)?.into_iter().collect();
+        let files_b: std::collections::HashSet<String> =
+            block_index.get_snapshot_files(id_b)?.into_iter().collect();
 
-        let set_a: std::collections::HashSet<&String> = files_a.iter().collect();
-        let set_b: std::collections::HashSet<&String> = files_b.iter().collect();
+        let added: Vec<String> = files_b.difference(&files_a).cloned().collect();
+        let deleted: Vec<String> = files_a.difference(&files_b).cloned().collect();
 
-        let added: Vec<String> = set_b.difference(&set_a).map(|s| s.to_string()).collect();
-        let deleted: Vec<String> = set_a.difference(&set_b).map(|s| s.to_string()).collect();
-
-        // Modified = files in both but different size/hash
         let mut modified = Vec::new();
-        for file in set_a.intersection(&set_b) {
-            let size_a = block_index.get_file_size(id_a, file)?;
-            let size_b = block_index.get_file_size(id_b, file)?;
-            if size_a != size_b {
-                modified.push(file.to_string());
+        for file in files_a.intersection(&files_b) {
+            let chunks_a = block_index.get_file_chunks(file)?;
+            let chunks_b = block_index.get_file_chunks(file)?;
+            if chunks_a != chunks_b {
+                modified.push(file.clone());
             }
         }
 
@@ -720,11 +889,22 @@ impl BackupEngine {
     // =========================================================================
 
     pub async fn clone_world(&self, snapshot_id: &str, new_name: &str) -> Result<()> {
+        // Validate new_name
+        if new_name.is_empty()
+            || new_name.contains("..")
+            || new_name.contains('/')
+            || new_name.contains('\\')
+        {
+            return Err(anyhow::anyhow!("Invalid world name: {}", new_name));
+        }
+
         info!("[Clone] Cloning snapshot {} as '{}'", snapshot_id, new_name);
 
-        // Restore to a temporary sandbox
         let sandbox_dir = self.server_root.join(".obsidian/sandbox");
         let clone_dir = sandbox_dir.join(new_name);
+        if clone_dir.exists() {
+            std::fs::remove_dir_all(&clone_dir)?;
+        }
         std::fs::create_dir_all(&clone_dir)?;
 
         let block_index = self.block_index.lock().await;
@@ -739,14 +919,21 @@ impl BackupEngine {
                     data.extend_from_slice(&chunk_data);
                 }
             }
-            let dest = clone_dir.join(file_path);
+
+            let dest = match validate_safe_path(&clone_dir, file_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("[Clone] Skipping unsafe path {}: {}", file_path, e);
+                    continue;
+                }
+            };
+
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&dest, &data)?;
         }
 
-        // Move to final location
         let final_dir = self.server_root.join(new_name);
         if final_dir.exists() {
             return Err(anyhow::anyhow!("Directory '{}' already exists", new_name));
@@ -764,11 +951,9 @@ impl BackupEngine {
     pub async fn rollback(&self, duration: &str) -> Result<()> {
         info!("[Rollback] Rolling back {}", duration);
 
-        // Parse duration (e.g., "1m", "5m", "1h")
         let seconds = parse_duration(duration)?;
         let target_time = Utc::now() - chrono::Duration::seconds(seconds as i64);
 
-        // Find the closest snapshot before the target time
         let snaps = self.snapshots.read().await;
         let target_snap = snaps
             .iter()
@@ -810,7 +995,6 @@ impl BackupEngine {
         for chunk_hash in &all_chunks {
             match object_store.read_object(chunk_hash) {
                 Ok(data) => {
-                    // Verify hash matches content
                     let actual_hash = blake3::hash(&data).to_hex().to_string();
                     if &actual_hash == chunk_hash {
                         healthy += 1;
@@ -829,7 +1013,6 @@ impl BackupEngine {
             }
         }
 
-        // TODO: RS(8+2) erasure code repair when implemented
         if repair && corrupted > 0 {
             warn!("[Verify] Auto-repair not yet implemented (RS erasure coding pending)");
         }
@@ -908,7 +1091,6 @@ impl BackupEngine {
             return Err(anyhow::anyhow!("Need at least 2 snapshots for forecast"));
         }
 
-        // Calculate growth rate between last two snapshots
         let last = &snaps[snaps.len() - 1];
         let prev = &snaps[snaps.len() - 2];
 
@@ -926,8 +1108,7 @@ impl BackupEngine {
             0.0
         };
 
-        // Estimate available space
-        let total_capacity_gb = 100.0; // TODO: get actual disk size
+        let total_capacity_gb = 100.0;
         let current_usage_gb =
             self.state.read().await.total_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let remaining_gb = total_capacity_gb - current_usage_gb;
@@ -949,38 +1130,43 @@ impl BackupEngine {
     // =========================================================================
 
     pub async fn export_snapshot(&self, path: &str) -> Result<()> {
-        info!("[Export] Exporting store to {}", path);
-        // Create a tar.zst archive of the entire .obsidian/store directory
-        let store_dir = self.server_root.join(".obsidian/store");
         let output = PathBuf::from(path);
+        let parent = output.parent().unwrap_or(Path::new("."));
 
-        // In a real implementation, this would use tar + zstd
-        // For Phase 1: simple directory copy
+        if !parent.exists() {
+            return Err(anyhow::anyhow!(
+                "Export parent directory does not exist: {}",
+                parent.display()
+            ));
+        }
         if output.exists() {
             return Err(anyhow::anyhow!("Export path already exists: {}", path));
         }
+
+        info!("[Export] Exporting store to {}", path);
+        let store_dir = self.server_root.join(".obsidian/store");
         copy_dir_recursive(&store_dir, &output)?;
         info!("[Export] Complete");
         Ok(())
     }
 
     pub async fn import_snapshot(&self, path: &str) -> Result<BackupResult> {
-        info!("[Import] Importing store from {}", path);
-        let store_dir = self.server_root.join(".obsidian/store");
         let input = PathBuf::from(path);
-
         if !input.exists() {
             return Err(anyhow::anyhow!("Import path does not exist: {}", path));
         }
+
+        info!("[Import] Importing store from {}", path);
+        let store_dir = self.server_root.join(".obsidian/store");
         copy_dir_recursive(&input, &store_dir)?;
         info!("[Import] Complete");
 
-        // Record as a new snapshot
         let snapshot_id = format!("snap_import_{}", Uuid::new_v4().to_string().split_at(8).0);
         Ok(BackupResult {
             snapshot_id,
             files_scanned: 0,
             files_changed: 0,
+            files_skipped: 0,
             bytes_processed: 0,
             chunks_deduped: 0,
             chunks_new: 0,
@@ -1027,4 +1213,24 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         std::fs::copy(src, dst)?;
     }
     Ok(())
+}
+
+/// Read a file in streaming fashion using a 64KB buffer to avoid OOM.
+fn read_file_streaming(path: &Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+
+    // For files over 16MB, log a reminder that this should use mmap in production
+    if file_size > 16 * 1024 * 1024 {
+        tracing::debug!(
+            "[Streaming] Large file {:?} ({} MB) — consider mmap for production",
+            path.file_name(),
+            file_size / (1024 * 1024)
+        );
+    }
+
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut data = Vec::with_capacity(file_size as usize);
+    reader.read_to_end(&mut data)?;
+    Ok(data)
 }

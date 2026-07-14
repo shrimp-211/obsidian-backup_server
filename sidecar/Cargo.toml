@@ -6,6 +6,10 @@ description = "Obsidian Backup Sidecar Daemon - Enterprise-grade CAS incremental
 license = "MIT"
 repository = "https://github.com/obsidian-backup/obsidian-backup"
 
+[lib]
+name = "obsidian_sidecar"
+path = "src/lib.rs"
+
 [[bin]]
 name = "obsidian-sidecar"
 path = "src/main.rs"
@@ -56,9 +60,7 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Error handling
-thiserror = "1"
 anyhow = "1"
-eyre = "0.6"
 
 # CLI argument parsing (for standalone mode)
 clap = { version = "4", features = ["derive", "env"] }

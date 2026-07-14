@@ -269,14 +269,8 @@ fn build_request(cmd: &Commands) -> Result<(String, Value)> {
         )),
         Commands::Forecast => Ok(("forecast".into(), json!({}))),
         Commands::Cancel => Ok(("cancel".into(), json!({}))),
-        Commands::Export { path } => Ok((
-            "backup".into(),
-            json!({ "export_path": path }),
-        )),
-        Commands::Import { path } => Ok((
-            "backup".into(),
-            json!({ "import_path": path }),
-        )),
+        Commands::Export { path } => Ok(("export".into(), json!({ "path": path }))),
+        Commands::Import { path } => Ok(("import".into(), json!({ "path": path }))),
     }
 }
 

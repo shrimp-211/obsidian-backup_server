@@ -62,15 +62,59 @@ impl IpcServer {
     }
 }
 
-/// Handle a single IPC connection.
+/// Handle a single IPC connection with token-based authentication.
+///
+/// The first message from the client MUST be an "auth" operation
+/// with a valid shared token. All subsequent messages are rejected
+/// until authentication succeeds.
 async fn handle_connection(
     stream: UnixStream,
     engine: Arc<BackupEngine>,
-    _config: SidecarConfig,
+    config: SidecarConfig,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
+    // Read auth message
+    let authenticated = match lines.next_line().await {
+        Ok(Some(line)) if !line.trim().is_empty() => match serde_json::from_str::<Value>(&line) {
+            Ok(req) if req.get("op").and_then(|v| v.as_str()) == Some("auth") => {
+                let token = req
+                    .get("params")
+                    .and_then(|p| p.get("token"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                verify_token(token, &config)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+
+    if !authenticated {
+        let response = json!({
+            "tx_id": null,
+            "status": "error",
+            "message": "Authentication failed: invalid or missing token"
+        });
+        let response_str = serde_json::to_string(&response)?;
+        writer.write_all(response_str.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Err(anyhow::anyhow!("IPC authentication failed"));
+    }
+
+    // Send auth success
+    let ok = json!({"tx_id": null, "status": "ok", "message": "authenticated"});
+    writer
+        .write_all(serde_json::to_string(&ok)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    info!("[IPC] Client authenticated successfully");
+
+    // Process subsequent messages
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
@@ -97,6 +141,27 @@ async fn handle_connection(
 
     debug!("[IPC] Connection closed");
     Ok(())
+}
+
+/// Verify a client authentication token against the configured shared secret.
+fn verify_token(token: &str, config: &SidecarConfig) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let expected = config
+        .security
+        .shared_token
+        .as_deref()
+        .unwrap_or("obsidian-default-token");
+    // Constant-time comparison
+    if token.len() != expected.len() {
+        return false;
+    }
+    token
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// Dispatch an IPC request to the appropriate handler based on the "op" field.
@@ -131,6 +196,8 @@ async fn dispatch(engine: &Arc<BackupEngine>, request: Value) -> Value {
         "pin" => handle_pin(engine, tx_id, params).await,
         "cancel" => handle_cancel(engine, tx_id).await,
         "forecast" => handle_forecast(engine, tx_id).await,
+        "export" => handle_export(engine, tx_id, params).await,
+        "import" => handle_import(engine, tx_id, params).await,
         _ => json!({
             "tx_id": tx_id,
             "status": "error",
@@ -146,58 +213,62 @@ async fn handle_backup(engine: &Arc<BackupEngine>, tx_id: &str, params: Value) -
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    // Check if there's an export/import path
-    if let Some(export_path) = params.get("export_path").and_then(|v| v.as_str()) {
-        match engine.export_snapshot(export_path).await {
-            Ok(_) => json!({
-                "tx_id": tx_id,
-                "status": "ok",
-                "data": { "export_path": export_path }
-            }),
-            Err(e) => json!({
-                "tx_id": tx_id,
-                "status": "error",
-                "message": format!("Export failed: {}", e)
-            }),
-        }
-    } else if let Some(import_path) = params.get("import_path").and_then(|v| v.as_str()) {
-        match engine.import_snapshot(import_path).await {
-            Ok(snapshot) => json!({
-                "tx_id": tx_id,
-                "status": "ok",
-                "data": {
-                    "snapshot_id": snapshot.snapshot_id,
-                    "files_scanned": snapshot.files_scanned,
-                    "bytes_processed": snapshot.bytes_processed
-                }
-            }),
-            Err(e) => json!({
-                "tx_id": tx_id,
-                "status": "error",
-                "message": format!("Import failed: {}", e)
-            }),
-        }
-    } else {
-        match engine.run_backup(tag, incremental).await {
-            Ok(snapshot) => json!({
-                "tx_id": tx_id,
-                "status": "ok",
-                "data": {
-                    "snapshot_id": snapshot.snapshot_id,
-                    "files_scanned": snapshot.files_scanned,
-                    "files_changed": snapshot.files_changed,
-                    "bytes_processed": snapshot.bytes_processed,
-                    "chunks_deduped": snapshot.chunks_deduped,
-                    "chunks_new": snapshot.chunks_new,
-                    "duration_ms": snapshot.duration_ms
-                }
-            }),
-            Err(e) => json!({
-                "tx_id": tx_id,
-                "status": "error",
-                "message": format!("Backup failed: {}", e)
-            }),
-        }
+    match engine.run_backup(tag, incremental).await {
+        Ok(snapshot) => json!({
+            "tx_id": tx_id,
+            "status": "ok",
+            "data": {
+                "snapshot_id": snapshot.snapshot_id,
+                "files_scanned": snapshot.files_scanned,
+                "files_changed": snapshot.files_changed,
+                "files_skipped": snapshot.files_skipped,
+                "bytes_processed": snapshot.bytes_processed,
+                "chunks_deduped": snapshot.chunks_deduped,
+                "chunks_new": snapshot.chunks_new,
+                "duration_ms": snapshot.duration_ms
+            }
+        }),
+        Err(e) => json!({
+            "tx_id": tx_id,
+            "status": "error",
+            "message": format!("Backup failed: {}", e)
+        }),
+    }
+}
+
+async fn handle_export(engine: &Arc<BackupEngine>, tx_id: &str, params: Value) -> Value {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match engine.export_snapshot(path).await {
+        Ok(_) => json!({
+            "tx_id": tx_id,
+            "status": "ok",
+            "data": { "export_path": path }
+        }),
+        Err(e) => json!({
+            "tx_id": tx_id,
+            "status": "error",
+            "message": format!("Export failed: {}", e)
+        }),
+    }
+}
+
+async fn handle_import(engine: &Arc<BackupEngine>, tx_id: &str, params: Value) -> Value {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match engine.import_snapshot(path).await {
+        Ok(snapshot) => json!({
+            "tx_id": tx_id,
+            "status": "ok",
+            "data": {
+                "snapshot_id": snapshot.snapshot_id,
+                "files_scanned": snapshot.files_scanned,
+                "bytes_processed": snapshot.bytes_processed
+            }
+        }),
+        Err(e) => json!({
+            "tx_id": tx_id,
+            "status": "error",
+            "message": format!("Import failed: {}", e)
+        }),
     }
 }
 

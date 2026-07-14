@@ -66,6 +66,9 @@ pub struct SecurityConfig {
     pub dual_admin_confirmation: bool,
 
     #[serde(default)]
+    pub shared_token: Option<String>,
+
+    #[serde(default)]
     pub snapshot_signing: SnapshotSigningConfig,
 
     #[serde(default)]
@@ -244,9 +247,10 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             dual_admin_confirmation: true,
+            shared_token: None,
             snapshot_signing: SnapshotSigningConfig {
                 enabled: true,
-                private_key_secure_path: Some("/etc/obsidian/keys/sign.key".into()),
+                private_key_secure_path: None,
             },
             immutable_locks: ImmutableLocksConfig {
                 weekly_retention_locked: true,

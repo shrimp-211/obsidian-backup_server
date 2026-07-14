@@ -17,11 +17,6 @@
 //!   - Ed25519 manifest signing
 //!   - Adaptive worker pool throttling
 
-mod backup;
-mod config;
-mod ipc;
-mod storage;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -112,6 +107,9 @@ async fn main() -> Result<()> {
         object_store,
         config.clone(),
     ));
+
+    // Load existing snapshot metadata from disk
+    engine.load_snapshots().await?;
 
     // Oneshot mode: run a single backup and exit
     if args.oneshot {
