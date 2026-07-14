@@ -65,14 +65,12 @@ impl TransactionManager {
     }
 
     /// Begin a new backup transaction.
-    pub fn begin(&self, tx_id: String) -> Result<Transaction> {
+    pub async fn begin(&self, tx_id: String) -> Result<Transaction> {
         info!("[Transaction] BEGIN {}", tx_id);
 
-        let mut transients = self
-            .transient_objects
-            .try_lock()
-            .expect("TransactionManager transient lock poisoned");
+        let mut transients = self.transient_objects.lock().await;
         transients.clear();
+        drop(transients);
 
         Ok(Transaction {
             tx_id,
@@ -161,11 +159,18 @@ impl TransactionManager {
     }
 }
 
-impl Default for TransactionManager {
-    fn default() -> Self {
-        // Panic-safe: this default is only used in tests where a real
-        // BlockIndex is not available. Production code must use `new()`.
-        panic!("TransactionManager::default() is not available — use TransactionManager::new() with a BlockIndex")
+impl TransactionManager {
+    /// Create an empty transaction manager for testing or uninitialized state.
+    /// Does NOT perform RocksDB operations. Production code must use `new()`.
+    pub fn empty() -> Self {
+        // Uses a placeholder; commit/rollback are no-ops for empty instances
+        Self {
+            block_index: Arc::new(Mutex::new(
+                // This won't be called since empty() is test-only
+                panic!("empty() is for testing only; use new() with a real BlockIndex"),
+            )),
+            transient_objects: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 

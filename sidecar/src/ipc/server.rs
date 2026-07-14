@@ -535,6 +535,3 @@ async fn handle_forecast(engine: &Arc<BackupEngine>, tx_id: &str) -> Value {
         }),
     }
 }
-
-// Re-export
-pub use server::*;

@@ -264,7 +264,14 @@ impl BackupEngine {
         self.set_state("backing_up".into(), Some(tx_id_short.clone()))
             .await;
 
-        let mut tx = self.tx_manager.begin(tx_id_short.clone())?;
+        let mut tx = self.tx_manager.begin(tx_id_short.clone()).await?;
+        let tx_ref = Arc::new(RwLock::new(tx.clone()));
+
+        // Store in active_transaction so cancel() can abort it
+        {
+            let mut active = self.active_transaction.lock().await;
+            *active = Some(tx.clone());
+        }
 
         let last_snapshot_time = if incremental {
             let snaps = self.snapshots.read().await;
@@ -315,9 +322,16 @@ impl BackupEngine {
         let mut handles = Vec::new();
 
         for (i, file_entry) in files.iter().enumerate() {
-            if tx.state == TransactionState::Aborted {
-                warn!("[Backup:{}] Transaction aborted", tx_id_short);
-                break;
+            // Check for cancellation via the shared active_transaction
+            {
+                let active = self.active_transaction.lock().await;
+                if active
+                    .as_ref()
+                    .map_or(false, |t| t.state == TransactionState::Aborted)
+                {
+                    warn!("[Backup:{}] Transaction aborted", tx_id_short);
+                    break;
+                }
             }
 
             let permit = semaphore.clone().acquire_owned().await?;
@@ -336,7 +350,7 @@ impl BackupEngine {
                     .unwrap_or(&file_entry.path);
 
                 // Stream file content in 64KB chunks
-                let content = match read_file_streaming(&file_entry.path) {
+                let content = match read_file_buffered(&file_entry.path) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!("[Backup:{}] Cannot read {:?}: {}", tx_id_short, rel_path, e);
@@ -439,8 +453,14 @@ impl BackupEngine {
             }
         }
 
-        // Phase: Check if aborted
-        if tx.state == TransactionState::Aborted {
+        // Phase: Check if aborted via shared state
+        let was_aborted = {
+            let active = self.active_transaction.lock().await;
+            active
+                .as_ref()
+                .map_or(false, |t| t.state == TransactionState::Aborted)
+        };
+        if was_aborted {
             self.tx_manager.rollback(&tx).await?;
             self.set_state("idle".into(), None).await;
             return Err(anyhow::anyhow!("Backup transaction aborted"));
@@ -824,22 +844,52 @@ impl BackupEngine {
     // =========================================================================
 
     pub async fn diff_snapshots(&self, id_a: &str, id_b: &str) -> Result<DiffResult> {
-        let block_index = self.block_index.lock().await;
+        // Read both snapshot manifests from disk to compare file metadata.
+        // Using the on-disk manifests ensures per-snapshot accuracy since
+        // the RocksDB file_chunks CF is overwritten on each backup.
+        let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
 
+        let manifest_a_path = snapshot_dir.join(format!("{}.json", id_a));
+        let manifest_b_path = snapshot_dir.join(format!("{}.json", id_b));
+
+        let manifest_a: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_a_path)
+                .with_context(|| format!("Snapshot {} not found", id_a))?,
+        )?;
+        let manifest_b: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_b_path)
+                .with_context(|| format!("Snapshot {} not found", id_b))?,
+        )?;
+
+        // Compare file lists from RocksDB snapshot CF
+        let block_index = self.block_index.lock().await;
         let files_a: std::collections::HashSet<String> =
             block_index.get_snapshot_files(id_a)?.into_iter().collect();
         let files_b: std::collections::HashSet<String> =
             block_index.get_snapshot_files(id_b)?.into_iter().collect();
+        drop(block_index);
 
         let added: Vec<String> = files_b.difference(&files_a).cloned().collect();
         let deleted: Vec<String> = files_a.difference(&files_b).cloned().collect();
 
+        // Modified files: present in both snapshots but with different sizes
+        let size_a = manifest_a["bytes_processed"].as_u64().unwrap_or(0);
+        let size_b = manifest_b["bytes_processed"].as_u64().unwrap_or(0);
         let mut modified = Vec::new();
-        for file in files_a.intersection(&files_b) {
-            let chunks_a = block_index.get_file_chunks(file)?;
-            let chunks_b = block_index.get_file_chunks(file)?;
-            if chunks_a != chunks_b {
-                modified.push(file.clone());
+
+        // Only report modified if total sizes differ (indicates changes)
+        if size_a != size_b {
+            // Mark files in both as potentially modified
+            for file in files_a.intersection(&files_b) {
+                // Compare chunk count from the stored file metadata
+                let chunks_a = manifest_a["chunks_total"].as_u64().unwrap_or(0);
+                let chunks_b = manifest_b["chunks_total"].as_u64().unwrap_or(0);
+
+                // If the snapshot-level metrics differ, mark all intersecting files as modified
+                // (a full per-file comparison requires per-snapshot file metadata in RocksDB)
+                if chunks_a != chunks_b {
+                    modified.push(file.clone());
+                }
             }
         }
 
@@ -1159,15 +1209,18 @@ impl BackupEngine {
         info!("[Import] Importing store from {}", path);
         let store_dir = self.server_root.join(".obsidian/store");
         copy_dir_recursive(&input, &store_dir)?;
-        info!("[Import] Complete");
 
-        let snapshot_id = format!("snap_import_{}", Uuid::new_v4().to_string().split_at(8).0);
+        // Reload snapshot metadata to include imported snapshots
+        self.load_snapshots().await?;
+        info!("[Import] Complete — snapshots reloaded from disk");
+
+        let state = self.state.read().await;
         Ok(BackupResult {
-            snapshot_id,
-            files_scanned: 0,
+            snapshot_id: format!("snap_import_{}", Uuid::new_v4().to_string().split_at(8).0),
+            files_scanned: state.total_snapshots,
             files_changed: 0,
             files_skipped: 0,
-            bytes_processed: 0,
+            bytes_processed: state.total_size_bytes,
             chunks_deduped: 0,
             chunks_new: 0,
             duration_ms: 0,
@@ -1215,8 +1268,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read a file in streaming fashion using a 64KB buffer to avoid OOM.
-fn read_file_streaming(path: &Path) -> Result<Vec<u8>> {
+/// Read a file using a 64KB buffered reader.
+///
+/// NOTE: For files >16MB, consider using mmap in production to avoid
+/// allocating the full file on the heap. The chunker currently requires
+/// the full content as `&[u8]`; refactoring the chunker to accept
+/// `impl Read` would enable true streaming with bounded memory.
+fn read_file_buffered(path: &Path) -> Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 

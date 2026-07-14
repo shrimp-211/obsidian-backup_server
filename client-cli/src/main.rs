@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
         }
         None => {
             eprintln!("{} No response from Sidecar", "Error:".red().bold());
+            anyhow::bail!("Sidecar did not respond");
         }
     }
 
