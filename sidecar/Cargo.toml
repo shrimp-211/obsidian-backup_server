@@ -1,0 +1,87 @@
+[package]
+name = "obsidian-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "Obsidian Backup Sidecar Daemon - Enterprise-grade CAS incremental backup engine for Minecraft"
+license = "MIT"
+repository = "https://github.com/obsidian-backup/obsidian-backup"
+
+[[bin]]
+name = "obsidian-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# FastCDC chunking
+fastcdc = "3"
+
+# RocksDB for local block index
+rocksdb = "0.22"
+
+# Hashing
+sha2 = "0.10"
+blake3 = "1"
+
+# Compression
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+# Encryption
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+x25519-dalek = "2"
+
+# Erasure coding
+reed-solomon-erasure = "6"
+
+# File system operations
+walkdir = "2"
+notify = { version = "6", features = ["macos_kqueue"] }
+fs2 = "0.2"
+filetime = "0.2"
+
+# Logging and configuration
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde_yaml = "0.9"
+toml = "0.8"
+
+# UUID generation
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+eyre = "0.6"
+
+# CLI argument parsing (for standalone mode)
+clap = { version = "4", features = ["derive", "env"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# CRC32C hardware-accelerated
+crc32c = "0.6"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# System resource monitoring
+sysinfo = "0.31"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

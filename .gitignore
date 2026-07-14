@@ -1,0 +1,25 @@
+# Rust
+sidecar/target/
+client-cli/target/
+
+# Gradle / NeoForge
+mod-neoforge/.gradle/
+mod-neoforge/build/
+mod-neoforge/out/
+mod-neoforge/run/
+mod-neoforge/logs/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Obsidian runtime
+.obsidian/ipc/obsidian.sock
+.obsidian/store/
+.obsidian/rocksdb/
+.obsidian/sandbox/
