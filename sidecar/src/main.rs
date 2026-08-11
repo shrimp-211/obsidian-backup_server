@@ -26,11 +26,11 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::backup::BackupEngine;
-use crate::config::SidecarConfig;
-use crate::ipc::IpcServer;
-use crate::storage::index::BlockIndex;
-use crate::storage::object_store::ObjectStore;
+use obsidian_sidecar::backup::BackupEngine;
+use obsidian_sidecar::config::SidecarConfig;
+use obsidian_sidecar::ipc::IpcServer;
+use obsidian_sidecar::storage::index::BlockIndex;
+use obsidian_sidecar::storage::object_store::ObjectStore;
 
 /// Obsidian Backup Sidecar — independent backup daemon for Minecraft servers.
 #[derive(Parser, Debug)]
@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
         let rs_config = config.remote_sync.clone();
         let rs_engine = engine.clone();
         tokio::spawn(async move {
-            let remote = crate::remote_sync::RemoteSync::new(rs_config, rs_engine);
+            let remote = obsidian_sidecar::remote_sync::RemoteSync::new(rs_config, rs_engine);
             if let Err(e) = remote.serve().await {
                 error!("[RemoteSync] serve failed: {}", e);
             }
