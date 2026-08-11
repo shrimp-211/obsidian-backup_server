@@ -1,14 +1,9 @@
 # Rust
-sidecar/target/
-client-cli/target/
+target/
+**/target/
 
-# Gradle (all modules)
-.gradle/
-**/build/
-**/.gradle/
-mod-neoforge/out/
-mod-neoforge/run/
-mod-neoforge/logs/
+# Obsidian runtime data
+.obsidian/
 
 # IDE
 .idea/
@@ -19,9 +14,5 @@ mod-neoforge/logs/
 .DS_Store
 Thumbs.db
 
-# Obsidian runtime
-.obsidian/ipc/obsidian.sock
-.obsidian/store/
-.obsidian/rocksdb/
-.obsidian/sandbox/
+# Claude
 .claude/

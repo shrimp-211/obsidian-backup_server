@@ -1,0 +1,42 @@
+name: Rust Build & Test
+
+on:
+  push:
+    branches: [master, main, develop]
+  pull_request:
+    branches: [master, main, develop]
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [sidecar, client-cli]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup update stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.package }}-${{ hashFiles(format('{0}/Cargo.toml', matrix.package)) }}
+
+      - name: Build ${{ matrix.package }}
+        run: cargo build
+        working-directory: ${{ matrix.package }}
+
+      - name: Test ${{ matrix.package }}
+        run: cargo test
+        working-directory: ${{ matrix.package }}
+
+      - name: Clippy ${{ matrix.package }}
+        run: cargo clippy -- -D warnings
+        working-directory: ${{ matrix.package }}
