@@ -3,7 +3,10 @@ name = "obsidian-cli"
 version = "0.1.0"
 edition = "2021"
 description = "Obsidian Backup CLI - Standalone client for the Obsidian Sidecar daemon"
-license = "MIT"
+license = "MPL-2.0"
+repository = "https://github.com/shrimp-211/obsidian-backup_server"
+keywords = ["minecraft", "backup", "cli"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "obsidian"

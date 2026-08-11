@@ -33,6 +33,32 @@ pub struct SidecarConfig {
 
     #[serde(default)]
     pub exclusion_rules: ExclusionRules,
+
+    #[serde(default)]
+    pub remote_sync: RemoteSyncConfig,
+}
+
+/// Remote synchronization between two Obsidian sidecars.
+///
+/// Either peer — the Minecraft server or the backup node — can be the active
+/// sender. The peer that has a public IP listens (`listen_addr`); the other
+/// peer dials it (`peer_addr`). Traffic is authenticated with a shared token
+/// and encrypted with XChaCha20-Poly1305.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address to listen on when this node is the public-IP peer.
+    #[serde(default)]
+    pub listen_addr: Option<String>,
+    /// Address of the peer to dial when the peer holds the public IP.
+    #[serde(default)]
+    pub peer_addr: Option<String>,
+    /// Shared authentication token for the sync channel.
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_dial_timeout")]
+    pub dial_timeout_secs: u64,
 }
 
 /// Multi-scheduler engine concurrency policy.
@@ -139,6 +165,19 @@ pub struct StorageConfig {
 
     #[serde(default)]
     pub rocksdb_reliability: RocksDbReliability,
+
+    #[serde(default)]
+    pub erasure_coding: ErasureCodingConfig,
+}
+
+/// Reed-Solomon (8+2) object-level erasure coding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErasureCodingConfig {
+    /// When enabled, objects are stored as 8 data shards + 2 parity shards,
+    /// allowing `verify repair` to self-heal up to 2 corrupted shards.
+    /// Adds ~25% storage overhead on top of the deduplicated bytes.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +212,9 @@ pub struct ExclusionRules {
 
 fn default_true() -> bool {
     true
+}
+fn default_dial_timeout() -> u64 {
+    30
 }
 fn default_sandbox_temp_dir() -> String {
     "./.obsidian/sandbox".into()
@@ -216,6 +258,19 @@ impl Default for SidecarConfig {
             adaptive_scheduler: AdaptiveSchedulerConfig::default(),
             storage: StorageConfig::default(),
             exclusion_rules: ExclusionRules::default(),
+            remote_sync: RemoteSyncConfig::default(),
+        }
+    }
+}
+
+impl Default for RemoteSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: None,
+            peer_addr: None,
+            token: "change-me".into(),
+            dial_timeout_secs: default_dial_timeout(),
         }
     }
 }
@@ -296,6 +351,7 @@ impl Default for StorageConfig {
                 checkpoint_interval_minutes: default_checkpoint_interval(),
                 auto_rebuild_from_pack: true,
             },
+            erasure_coding: ErasureCodingConfig { enabled: true },
         }
     }
 }

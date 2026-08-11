@@ -143,6 +143,15 @@ enum Commands {
         path: String,
     },
 
+    /// Synchronize a snapshot with a remote peer (both sides can be the
+    /// active sender — the peer with a public IP acts as the listener)
+    RemoteSync {
+        /// Action: push | pull
+        action: String,
+        /// Snapshot ID to transfer
+        snapshot_id: String,
+    },
+
     /// Import snapshot archive
     Import {
         /// Path to .tar.zst archive
@@ -272,6 +281,10 @@ fn build_request(cmd: &Commands) -> Result<(String, Value)> {
         Commands::Cancel => Ok(("cancel".into(), json!({}))),
         Commands::Export { path } => Ok(("export".into(), json!({ "path": path }))),
         Commands::Import { path } => Ok(("import".into(), json!({ "path": path }))),
+        Commands::RemoteSync { action, snapshot_id } => Ok((
+            "remote_sync".into(),
+            json!({ "action": action, "snapshot_id": snapshot_id }),
+        )),
     }
 }
 

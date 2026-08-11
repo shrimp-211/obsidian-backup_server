@@ -2,7 +2,7 @@ pub mod chunker;
 pub mod scanner;
 pub mod transaction;
 
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,10 +14,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::SidecarConfig;
+use crate::signing::{self, SnapshotSigner};
 use crate::storage::index::BlockIndex;
-use crate::storage::object_store::ObjectStore;
+use crate::storage::object_store::{ObjectKind, ObjectStore, RepairOutcome};
 
-use self::chunker::ChunkEngine;
+use self::chunker::{Chunk, ChunkEngine};
 use self::scanner::FileScanner;
 use self::transaction::{Transaction, TransactionManager, TransactionState};
 
@@ -70,6 +71,7 @@ pub struct BackupEngine {
     tx_manager: TransactionManager,
     state: Arc<RwLock<SystemState>>,
     snapshots: Arc<RwLock<Vec<SnapshotInfo>>>,
+    signer: Option<SnapshotSigner>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +198,32 @@ impl BackupEngine {
         let block_index = Arc::new(Mutex::new(block_index));
         let tx_manager = TransactionManager::new(block_index.clone());
 
+        // Initialise the Ed25519 signer when snapshot signing is enabled.
+        let signer = if config.security.snapshot_signing.enabled {
+            let key_path = config
+                .security
+                .snapshot_signing
+                .private_key_secure_path
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| server_root.join(".obsidian/keys/sign.key"));
+            match SnapshotSigner::load_or_create(&key_path) {
+                Ok(s) => {
+                    info!(
+                        "[BackupEngine] Snapshot signing enabled (key: {:?})",
+                        s.key_path()
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    warn!("[BackupEngine] Snapshot signing failed to initialise: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             scanner: FileScanner::new(server_root.clone(), config.clone()),
             server_root,
@@ -206,6 +234,7 @@ impl BackupEngine {
             tx_manager,
             state: Arc::new(RwLock::new(SystemState::default())),
             snapshots: Arc::new(RwLock::new(Vec::new())),
+            signer,
         }
     }
 
@@ -348,29 +377,36 @@ impl BackupEngine {
                     .path
                     .strip_prefix(&server_root)
                     .unwrap_or(&file_entry.path);
+                let rel = rel_path.to_string_lossy().to_string();
+                let file_bytes = file_entry.size;
 
-                // Stream file content in 64KB chunks
-                let content = match read_file_buffered(&file_entry.path) {
-                    Ok(data) => data,
+                // Stream the file with bounded memory — only up to one chunk
+                // (max_size) is held in RAM, never the whole file. This removes
+                // the OOM risk for large Minecraft region files.
+                let file = match std::fs::File::open(&file_entry.path) {
+                    Ok(f) => f,
                     Err(e) => {
                         warn!("[Backup:{}] Cannot read {:?}: {}", tx_id_short, rel_path, e);
-                        return Err((rel_path.to_string_lossy().to_string(), e.to_string()));
+                        return Err((rel, e.to_string()));
                     }
                 };
+                let mut reader = BufReader::new(file);
 
                 let chunk_engine = ChunkEngine::new();
-                let chunks = chunk_engine.chunk_file(&content, rel_path.to_string_lossy().as_ref());
-
-                let mut file_chunk_hashes = Vec::with_capacity(chunks.len());
+                let mut file_chunk_hashes: Vec<String> = Vec::new();
                 let mut file_chunks_deduped: u64 = 0;
                 let mut file_chunks_new: u64 = 0;
-                let file_bytes = content.len() as u64;
 
-                {
-                    let index = block_index.lock().await;
-                    let mut store = object_store.write().await;
+                // Acquire all locks once; the streaming closure is synchronous.
+                let index = block_index.lock().await;
+                let mut store = object_store.write().await;
+                let mut transients = tx_manager.lock().await;
 
-                    for chunk in &chunks {
+                let rel_clone = rel.clone();
+                let chunk_result = chunk_engine.chunk_reader(
+                    &mut reader,
+                    &rel,
+                    &mut |chunk: &Chunk| -> anyhow::Result<()> {
                         let exists = index.chunk_exists(&chunk.hash).unwrap_or(false);
                         file_chunk_hashes.push(chunk.hash.clone());
 
@@ -389,43 +425,43 @@ impl BackupEngine {
                                     &chunk.hash[..8],
                                     e
                                 );
-                                continue;
-                            }
-                            // Track for potential rollback
-                            {
-                                let mut transients = tx_manager.lock().await;
+                            } else {
                                 transients.push(transaction::TransientObject {
                                     chunk_hash: chunk.hash.clone(),
                                     object_path: format!(".obsidian/store/objects/{}", &chunk.hash),
                                 });
-                            }
-                            if let Err(e) = index.insert_chunk(
-                                &chunk.hash,
-                                rel_path.to_string_lossy().as_ref(),
-                                chunk.offset as u64,
-                                chunk.size as u64,
-                            ) {
-                                warn!("[Backup] Failed to index chunk: {}", e);
+                                if let Err(e) = index.insert_chunk(
+                                    &chunk.hash,
+                                    &rel_clone,
+                                    chunk.offset as u64,
+                                    chunk.size as u64,
+                                ) {
+                                    warn!("[Backup] Failed to index chunk: {}", e);
+                                }
                             }
                         }
-                    }
+                        Ok(())
+                    },
+                );
 
-                    if let Err(e) = index.insert_file_chunks(
-                        rel_path.to_string_lossy().as_ref(),
-                        &file_chunk_hashes,
-                        file_entry.size,
-                        file_entry.modified,
-                    ) {
-                        warn!("[Backup] Failed to store file→chunks mapping: {}", e);
-                    }
+                if let Err(e) = chunk_result {
+                    return Err((rel_clone, format!("chunking failed: {}", e)));
                 }
 
-                Ok((
-                    rel_path.to_string_lossy().to_string(),
-                    file_bytes,
-                    file_chunks_deduped,
-                    file_chunks_new,
-                ))
+                if let Err(e) = index.insert_file_chunks(
+                    &rel_clone,
+                    &file_chunk_hashes,
+                    file_entry.size,
+                    file_entry.modified,
+                ) {
+                    warn!("[Backup] Failed to store file→chunks mapping: {}", e);
+                }
+
+                drop(transients);
+                drop(store);
+                drop(index);
+
+                Ok((rel_clone, file_bytes, file_chunks_deduped, file_chunks_new))
             });
 
             handles.push(handle);
@@ -494,7 +530,16 @@ impl BackupEngine {
         let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
         std::fs::create_dir_all(&snapshot_dir)?;
         let manifest_path = snapshot_dir.join(format!("{}.json", snapshot_id));
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&manifest_path, &manifest_json)?;
+
+        // Ed25519-sign the manifest so restores detect offline tampering.
+        if let Some(signer) = &self.signer {
+            let sig = signer.sign(manifest_json.as_bytes());
+            let sig_path = snapshot_dir.join(format!("{}.sig", snapshot_id));
+            std::fs::write(&sig_path, sig)?;
+            info!("[Backup:{}] Signed manifest (Ed25519)", tx_id_short);
+        }
 
         // Store snapshot→files mapping in RocksDB
         {
@@ -628,8 +673,10 @@ impl BackupEngine {
         ));
         std::fs::create_dir_all(&sandbox_tx)?;
 
-        let _manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        let manifest_str = std::fs::read_to_string(&manifest_path)?;
+        // Reject restores of tampered snapshots when a signature exists.
+        self.verify_manifest_signature(snapshot_id, &manifest_str)?;
+        let _manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
 
         let block_index = self.block_index.lock().await;
         let object_store = self.object_store.read().await;
@@ -1034,6 +1081,31 @@ impl BackupEngine {
     pub async fn verify(&self, repair: bool) -> Result<VerifyResult> {
         info!("[Verify] Starting integrity check (repair={})", repair);
 
+        // 1) Verify the Ed25519 signature of every signed snapshot manifest.
+        let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
+        let mut signature_failures: u64 = 0;
+        if snapshot_dir.exists() {
+            for entry in std::fs::read_dir(&snapshot_dir)? {
+                let path = entry?.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.ends_with(".json") || name.ends_with(".pin") {
+                    continue;
+                }
+                let snap_id = name.trim_end_matches(".json");
+                let sig_path = snapshot_dir.join(format!("{}.sig", snap_id));
+                if sig_path.exists() {
+                    if let Ok(manifest_str) = std::fs::read_to_string(&path) {
+                        if self.verify_manifest_signature(snap_id, &manifest_str).is_err() {
+                            signature_failures += 1;
+                            warn!("[Verify] Snapshot {} failed signature check", snap_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) Verify chunk integrity. Sharded objects carry RS(8+2) parity and
+        // can be self-healed; loose/packed objects are hash-checked only.
         let block_index = self.block_index.lock().await;
         let object_store = self.object_store.read().await;
 
@@ -1043,44 +1115,132 @@ impl BackupEngine {
         let mut repaired: u64 = 0;
 
         for chunk_hash in &all_chunks {
-            match object_store.read_object(chunk_hash) {
-                Ok(data) => {
-                    let actual_hash = blake3::hash(&data).to_hex().to_string();
-                    if &actual_hash == chunk_hash {
-                        healthy += 1;
-                    } else {
-                        corrupted += 1;
-                        warn!(
-                            "[Verify] Hash mismatch for chunk {} (expected {}, got {})",
-                            chunk_hash, chunk_hash, actual_hash
-                        );
+            match object_store.object_kind(chunk_hash) {
+                Some(ObjectKind::Sharded) => {
+                    match object_store.verify_object(chunk_hash, repair) {
+                        Ok(RepairOutcome::Healthy) => healthy += 1,
+                        Ok(RepairOutcome::Repaired) => {
+                            healthy += 1;
+                            repaired += 1;
+                        }
+                        Ok(RepairOutcome::Corrupted) | Ok(RepairOutcome::Unrecoverable) => {
+                            corrupted += 1;
+                        }
+                        Err(e) => {
+                            corrupted += 1;
+                            warn!(
+                                "[Verify] Sharded chunk {} check failed: {}",
+                                chunk_hash, e
+                            );
+                        }
                     }
                 }
-                Err(_) => {
+                Some(ObjectKind::Individual) | Some(ObjectKind::Packfile) => {
+                    match object_store.read_object(chunk_hash) {
+                        Ok(data) => {
+                            let actual_hash = blake3::hash(&data).to_hex().to_string();
+                            if &actual_hash == chunk_hash {
+                                healthy += 1;
+                            } else {
+                                corrupted += 1;
+                                warn!(
+                                    "[Verify] Hash mismatch for chunk {} (expected {}, got {})",
+                                    chunk_hash, chunk_hash, actual_hash
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            corrupted += 1;
+                            warn!("[Verify] Missing chunk: {}", chunk_hash);
+                        }
+                    }
+                }
+                None => {
                     corrupted += 1;
-                    warn!("[Verify] Missing chunk: {}", chunk_hash);
+                    warn!(
+                        "[Verify] Chunk {} is not present in the object store",
+                        chunk_hash
+                    );
                 }
             }
         }
 
         if repair && corrupted > 0 {
-            warn!("[Verify] Auto-repair not yet implemented (RS erasure coding pending)");
+            warn!(
+                "[Verify] {} chunks remain unrecoverable (only sharded objects carry RS parity)",
+                corrupted
+            );
         }
 
         info!(
-            "[Verify] Complete: {} total, {} healthy, {} corrupted, {} repaired",
+            "[Verify] Complete: {} chunks, {} healthy, {} corrupted, {} repaired, {} signature failures",
             all_chunks.len(),
             healthy,
             corrupted,
-            repaired
+            repaired,
+            signature_failures
         );
 
         Ok(VerifyResult {
             total_checked: all_chunks.len() as u64,
             healthy,
-            corrupted,
+            corrupted: corrupted + signature_failures,
             repaired,
         })
+    }
+
+    /// Verify the Ed25519 signature of a snapshot manifest, if one exists.
+    ///
+    /// Unsigned snapshots (signing was disabled at backup time) pass through.
+    /// Returns an error when a signature exists but does not validate,
+    /// indicating the manifest was tampered with offline.
+    fn verify_manifest_signature(&self, snapshot_id: &str, manifest_json: &str) -> Result<()> {
+        let sig_path = self
+            .server_root
+            .join(".obsidian/store/snapshots")
+            .join(format!("{}.sig", snapshot_id));
+
+        if !sig_path.exists() {
+            return Ok(()); // unsigned snapshot — nothing to check
+        }
+
+        let sig = std::fs::read_to_string(&sig_path)?;
+        let pub_key = self
+            .public_key_bytes()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Snapshot {} has a signature but no verifying key is available",
+                    snapshot_id
+                )
+            })?;
+
+        if signing::verify_signature(manifest_json.as_bytes(), &sig, &pub_key) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "Snapshot {} signature verification FAILED — manifest may be tampered",
+                snapshot_id
+            ))
+        }
+    }
+
+    /// The 32-byte Ed25519 verifying key, from the live signer or the
+    /// persisted `.pub` file.
+    fn public_key_bytes(&self) -> Option<[u8; 32]> {
+        if let Some(s) = &self.signer {
+            return Some(s.verifying_key_bytes());
+        }
+        let key_path = self
+            .config
+            .security
+            .snapshot_signing
+            .private_key_secure_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.server_root.join(".obsidian/keys/sign.key"));
+        std::fs::read(signing::public_key_path(&key_path))
+            .ok()
+            .and_then(|b| b.try_into().ok())
     }
 
     // =========================================================================
@@ -1226,6 +1386,80 @@ impl BackupEngine {
             duration_ms: 0,
         })
     }
+    // =========================================================================
+    // Remote sync support (peer-to-peer snapshot transfer)
+    // =========================================================================
+
+    /// Read a snapshot manifest as JSON.
+    pub async fn snapshot_manifest_json(&self, snapshot_id: &str) -> Result<serde_json::Value> {
+        let path = self
+            .server_root
+            .join(".obsidian/store/snapshots")
+            .join(format!("{}.json", snapshot_id));
+        Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
+    }
+
+    /// List the files recorded in a snapshot.
+    pub async fn snapshot_files(&self, snapshot_id: &str) -> Result<Vec<String>> {
+        let index = self.block_index.lock().await;
+        index.get_snapshot_files(snapshot_id)
+    }
+
+    /// Chunk hashes recorded for a file path.
+    pub async fn file_chunks(&self, path: &str) -> Result<Vec<String>> {
+        let index = self.block_index.lock().await;
+        index.get_file_chunks(path)
+    }
+
+    /// Read an object from the store by content hash.
+    pub async fn read_object_data(&self, hash: &str) -> Result<Vec<u8>> {
+        let store = self.object_store.read().await;
+        store.read_object(hash)
+    }
+
+    /// Store an object received from a peer (dedup-aware reference counting).
+    pub async fn store_object(&self, hash: &str, data: &[u8]) -> Result<()> {
+        let index = self.block_index.lock().await;
+        let exists = index.chunk_exists(hash)?;
+        let mut store = self.object_store.write().await;
+        store.write_object(hash, data, data.len() as u64)?;
+        if exists {
+            index.increment_ref(hash)?;
+        } else {
+            index.insert_chunk(hash, "<remote>", 0, data.len() as u64)?;
+        }
+        Ok(())
+    }
+
+    /// Record a file→chunks mapping received from a peer.
+    pub async fn store_file_chunks(&self, path: &str, chunks: &[String]) -> Result<()> {
+        let index = self.block_index.lock().await;
+        index.insert_file_chunks(path, chunks, 0, 0)
+    }
+
+    /// Persist a remote snapshot manifest and add it to the snapshot cache.
+    pub async fn register_remote_snapshot(
+        &self,
+        snapshot_id: &str,
+        manifest: serde_json::Value,
+    ) -> Result<()> {
+        let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
+        std::fs::create_dir_all(&snapshot_dir)?;
+        let path = snapshot_dir.join(format!("{}.json", snapshot_id));
+        std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
+
+        let mut snaps = self.snapshots.write().await;
+        snaps.push(SnapshotInfo {
+            snapshot_id: snapshot_id.to_string(),
+            timestamp: manifest["timestamp"].as_str().unwrap_or("").to_string(),
+            tag: manifest["tag"].as_str().map(String::from),
+            files_scanned: manifest["files_scanned"].as_u64().unwrap_or(0),
+            bytes_processed: manifest["bytes_processed"].as_u64().unwrap_or(0),
+            chunks_total: manifest["chunks_total"].as_u64().unwrap_or(0),
+            chunks_deduped: manifest["chunks_deduped"].as_u64().unwrap_or(0),
+        });
+        Ok(())
+    }
 }
 
 // =========================================================================
@@ -1268,27 +1502,3 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read a file using a 64KB buffered reader.
-///
-/// NOTE: For files >16MB, consider using mmap in production to avoid
-/// allocating the full file on the heap. The chunker currently requires
-/// the full content as `&[u8]`; refactoring the chunker to accept
-/// `impl Read` would enable true streaming with bounded memory.
-fn read_file_buffered(path: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-
-    // For files over 16MB, log a reminder that this should use mmap in production
-    if file_size > 16 * 1024 * 1024 {
-        tracing::debug!(
-            "[Streaming] Large file {:?} ({} MB) — consider mmap for production",
-            path.file_name(),
-            file_size / (1024 * 1024)
-        );
-    }
-
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut data = Vec::with_capacity(file_size as usize);
-    reader.read_to_end(&mut data)?;
-    Ok(data)
-}

@@ -2,9 +2,10 @@
 sidecar/target/
 client-cli/target/
 
-# Gradle / NeoForge
-mod-neoforge/.gradle/
-mod-neoforge/build/
+# Gradle (all modules)
+.gradle/
+**/build/
+**/.gradle/
 mod-neoforge/out/
 mod-neoforge/run/
 mod-neoforge/logs/

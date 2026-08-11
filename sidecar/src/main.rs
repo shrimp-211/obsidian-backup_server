@@ -149,6 +149,20 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Remote sync listener: when this node owns a public IP, accept
+    // connections from the peer and receive / answer snapshot transfers.
+    if config.remote_sync.enabled && config.remote_sync.listen_addr.is_some() {
+        let rs_config = config.remote_sync.clone();
+        let rs_engine = engine.clone();
+        tokio::spawn(async move {
+            let remote = crate::remote_sync::RemoteSync::new(rs_config, rs_engine);
+            if let Err(e) = remote.serve().await {
+                error!("[RemoteSync] serve failed: {}", e);
+            }
+        });
+        info!("[RemoteSync] Remote sync listener active (public-IP peer)");
+    }
+
     info!("[IPC] Starting UDS server on {:?}", socket_path);
     let ipc_server = IpcServer::new(socket_path, engine, config);
 

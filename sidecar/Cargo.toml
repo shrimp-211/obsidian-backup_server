@@ -3,8 +3,10 @@ name = "obsidian-sidecar"
 version = "0.1.0"
 edition = "2021"
 description = "Obsidian Backup Sidecar Daemon - Enterprise-grade CAS incremental backup engine for Minecraft"
-license = "MIT"
-repository = "https://github.com/obsidian-backup/obsidian-backup"
+license = "MPL-2.0"
+repository = "https://github.com/shrimp-211/obsidian-backup"
+keywords = ["minecraft", "backup", "cas", "deduplication", "snapshot"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "obsidian_sidecar"
@@ -41,8 +43,8 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 x25519-dalek = "2"
 
-# Erasure coding
-reed-solomon-erasure = "6"
+# Erasure coding (pure-Rust implementation — portable, no C toolchain needed)
+reed-solomon-erasure = { version = "6", default-features = false }
 
 # File system operations
 walkdir = "2"

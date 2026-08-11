@@ -123,7 +123,7 @@ async fn handle_connection(
         debug!("[IPC] Received: {}", &line[..line.len().min(200)]);
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => dispatch(&engine, request).await,
+            Ok(request) => dispatch(&engine, &config, request).await,
             Err(e) => {
                 json!({
                     "tx_id": null,
@@ -165,7 +165,7 @@ fn verify_token(token: &str, config: &SidecarConfig) -> bool {
 }
 
 /// Dispatch an IPC request to the appropriate handler based on the "op" field.
-async fn dispatch(engine: &Arc<BackupEngine>, request: Value) -> Value {
+async fn dispatch(engine: &Arc<BackupEngine>, config: &SidecarConfig, request: Value) -> Value {
     let tx_id = request
         .get("tx_id")
         .and_then(|v| v.as_str())
@@ -198,6 +198,7 @@ async fn dispatch(engine: &Arc<BackupEngine>, request: Value) -> Value {
         "forecast" => handle_forecast(engine, tx_id).await,
         "export" => handle_export(engine, tx_id, params).await,
         "import" => handle_import(engine, tx_id, params).await,
+        "remote_sync" => handle_remote_sync(engine, config, tx_id, params).await,
         _ => json!({
             "tx_id": tx_id,
             "status": "error",
@@ -268,6 +269,59 @@ async fn handle_import(engine: &Arc<BackupEngine>, tx_id: &str, params: Value) -
             "tx_id": tx_id,
             "status": "error",
             "message": format!("Import failed: {}", e)
+        }),
+    }
+}
+
+async fn handle_remote_sync(
+    engine: &Arc<BackupEngine>,
+    config: &SidecarConfig,
+    tx_id: &str,
+    params: Value,
+) -> Value {
+    use crate::remote_sync::RemoteSync;
+
+    let action = params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("push");
+    let snapshot_id = params
+        .get("snapshot_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let result = match action {
+        "push" => {
+            let remote = RemoteSync::new(config.remote_sync.clone(), engine.clone());
+            remote.push_snapshot(snapshot_id).await
+        }
+        "pull" => {
+            let remote = RemoteSync::new(config.remote_sync.clone(), engine.clone());
+            remote.pull_snapshot(snapshot_id).await
+        }
+        "serve" => {
+            // Run the listener detached; it accepts connections until shutdown.
+            let remote = RemoteSync::new(config.remote_sync.clone(), engine.clone());
+            tokio::spawn(async move {
+                if let Err(e) = remote.serve().await {
+                    error!("[RemoteSync] serve task failed: {}", e);
+                }
+            });
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("unknown remote_sync action: {}", other)),
+    };
+
+    match result {
+        Ok(_) => json!({
+            "tx_id": tx_id,
+            "status": "ok",
+            "message": format!("Remote sync ({}) complete", action)
+        }),
+        Err(e) => json!({
+            "tx_id": tx_id,
+            "status": "error",
+            "message": format!("Remote sync failed: {}", e)
         }),
     }
 }
