@@ -172,7 +172,8 @@ mod tests {
         let idx = Arc::new(Mutex::new(idx));
 
         let tm = TransactionManager::new(idx);
-        let mut tx = tm.begin("tx_test01".into()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut tx = rt.block_on(tm.begin("tx_test01".into())).unwrap();
 
         assert_eq!(tx.state, TransactionState::Active);
         assert_eq!(tx.files_processed, 0);
@@ -199,7 +200,10 @@ mod tests {
         tm.track_object("hash2", ".obsidian/store/objects/hash2");
 
         // Begin clears transients
-        let _tx = tm.begin("tx_new".into()).unwrap();
+        let _tx = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tm.begin("tx_new".into()))
+            .unwrap();
 
         // After begin, transients should be cleared
         let rt = tokio::runtime::Runtime::new().unwrap();
