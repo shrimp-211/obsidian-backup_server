@@ -64,7 +64,7 @@ async fn setup_test_harness() -> TestHarness {
     }
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_full_backup_and_restore_cycle() {
     let harness = setup_test_harness().await;
 
@@ -117,7 +117,7 @@ async fn test_full_backup_and_restore_cycle() {
     );
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_status_reports_correctly() {
     let harness = setup_test_harness().await;
 
@@ -126,7 +126,7 @@ async fn test_status_reports_correctly() {
     assert_eq!(state.state, "idle");
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_top_files_analysis() {
     let harness = setup_test_harness().await;
 
@@ -145,7 +145,7 @@ async fn test_top_files_analysis() {
     assert!(!top.files.is_empty(), "Should have files in top list");
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_verify_checks_integrity() {
     let harness = setup_test_harness().await;
 
@@ -174,7 +174,7 @@ async fn test_verify_checks_integrity() {
     );
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_path_validation_rejects_traversal() {
     let harness = setup_test_harness().await;
 
@@ -202,7 +202,7 @@ async fn test_path_validation_rejects_traversal() {
     );
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_clone_rejects_bad_names() {
     let harness = setup_test_harness().await;
 
@@ -238,7 +238,7 @@ async fn test_clone_rejects_bad_names() {
     }
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_concurrent_backups_do_not_deadlock() {
     let harness = setup_test_harness().await;
 
@@ -256,7 +256,7 @@ async fn test_concurrent_backups_do_not_deadlock() {
     assert!(r2.is_ok(), "Second backup should succeed");
 }
 
-#[tokio::test(timeout = 120)]
+#[tokio::test]
 async fn test_forecast_needs_two_snapshots() {
     let harness = setup_test_harness().await;
 
