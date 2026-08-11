@@ -185,7 +185,6 @@ fn to_unix_timestamp(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_scanner_respects_exclusions() {

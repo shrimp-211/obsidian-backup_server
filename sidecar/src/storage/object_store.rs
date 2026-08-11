@@ -36,7 +36,6 @@ const PARITY_HEADER_LEN: usize = 16 + TOTAL_SHARDS * 32;
 
 /// CAS Object Store managing individual objects, sharded objects and Packfiles.
 pub struct ObjectStore {
-    root: PathBuf,
     objects_dir: PathBuf,
     packfile_dir: PathBuf,
     parity_dir: PathBuf,
@@ -120,7 +119,6 @@ impl ObjectStore {
         fs::create_dir_all(&parity_dir)?;
 
         let mut store = Self {
-            root: root.to_path_buf(),
             objects_dir,
             packfile_dir,
             parity_dir,

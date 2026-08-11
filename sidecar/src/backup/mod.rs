@@ -294,7 +294,6 @@ impl BackupEngine {
             .await;
 
         let mut tx = self.tx_manager.begin(tx_id_short.clone()).await?;
-        let tx_ref = Arc::new(RwLock::new(tx.clone()));
 
         // Store in active_transaction so cancel() can abort it
         {
@@ -350,7 +349,7 @@ impl BackupEngine {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
         let mut handles = Vec::new();
 
-        for (i, file_entry) in files.iter().enumerate() {
+        for file_entry in files.iter() {
             // Check for cancellation via the shared active_transaction
             {
                 let active = self.active_transaction.lock().await;
