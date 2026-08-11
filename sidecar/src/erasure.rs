@@ -122,13 +122,9 @@ impl ErasureCodec {
             }
         }
 
-        {
-            let mut refs: Vec<Option<&mut [u8]>> = all
-                .iter_mut()
-                .map(|s| s.as_mut().map(|v| v.as_mut_slice()))
-                .collect();
-            self.rs.borrow_mut().reconstruct(&mut refs)?;
-        }
+        // `reconstruct` requires `Option<Vec<u8>>` shards (Vec<u8> satisfies
+        // `FromIterator<u8>`), not `Option<&mut [u8]>`.
+        self.rs.borrow_mut().reconstruct(&mut all)?;
 
         let data = all[..DATA_SHARDS]
             .iter()
