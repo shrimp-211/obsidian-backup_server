@@ -14,7 +14,6 @@
 //!   "file_meta"    — file_path@snapshot_id → { size, mtime, chunk_count }
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::Result;
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
@@ -177,19 +176,6 @@ impl BlockIndex {
         self.db
             .put_cf(&cf, chunk_hash.as_bytes(), &count.to_le_bytes())?;
         Ok(())
-    }
-
-    /// Get the reference count for a chunk.
-    fn get_ref_count(&self, chunk_hash: &str) -> Result<u64> {
-        let cf = self
-            .db
-            .cf_handle(CF_CHUNK_REFS)
-            .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_CHUNK_REFS))?;
-
-        match self.db.get_cf(&cf, chunk_hash.as_bytes())? {
-            Some(data) if data.len() == 8 => Ok(u64::from_le_bytes(data[..8].try_into().unwrap())),
-            _ => Ok(0),
-        }
     }
 
     // =========================================================================

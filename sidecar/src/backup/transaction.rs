@@ -53,7 +53,7 @@ pub struct TransientObject {
 pub struct TransactionManager {
     block_index: Arc<Mutex<BlockIndex>>,
     /// Transient objects created during this transaction (cleaned on rollback)
-    transient_objects: Arc<Mutex<Vec<TransientObject>>>,
+    pub(crate) transient_objects: Arc<Mutex<Vec<TransientObject>>>,
 }
 
 impl TransactionManager {
@@ -134,7 +134,7 @@ impl TransactionManager {
         // Remove transient objects from the RocksDB index
         // (the actual object files will be cleaned by GC)
         let transients = self.transient_objects.lock().await;
-        let mut index = self.block_index.lock().await;
+        let index = self.block_index.lock().await;
 
         for obj in transients.iter() {
             // Decrement reference count — if it reaches 0, GC can remove it
@@ -156,21 +156,6 @@ impl TransactionManager {
 
         info!("[Transaction] ROLLBACK {} complete", tx.tx_id);
         Ok(())
-    }
-}
-
-impl TransactionManager {
-    /// Create an empty transaction manager for testing or uninitialized state.
-    /// Does NOT perform RocksDB operations. Production code must use `new()`.
-    pub fn empty() -> Self {
-        // Uses a placeholder; commit/rollback are no-ops for empty instances
-        Self {
-            block_index: Arc::new(Mutex::new(
-                // This won't be called since empty() is test-only
-                panic!("empty() is for testing only; use new() with a real BlockIndex"),
-            )),
-            transient_objects: Arc::new(Mutex::new(Vec::new())),
-        }
     }
 }
 

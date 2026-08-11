@@ -66,7 +66,7 @@ impl ErasureCodec {
 
         {
             let mut refs: Vec<&mut [u8]> =
-                shards.iter_mut().map(Vec::as_mut_slice).collect();
+                shards.iter_mut().map(|v| v.as_mut_slice()).collect();
             self.rs.borrow_mut().encode(&mut refs)?;
         }
 
@@ -125,7 +125,7 @@ impl ErasureCodec {
         {
             let mut refs: Vec<Option<&mut [u8]>> = all
                 .iter_mut()
-                .map(|s| s.as_mut().map(Vec::as_mut_slice))
+                .map(|s| s.as_mut().map(|v| v.as_mut_slice()))
                 .collect();
             self.rs.borrow_mut().reconstruct(&mut refs)?;
         }

@@ -605,10 +605,11 @@ impl BackupEngine {
     }
 
     async fn set_state(&self, state: String, tx: Option<String>) {
+        let running = tx.is_some();
         let mut s = self.state.write().await;
         s.state = state;
         s.current_tx = tx;
-        s.running = tx.is_some();
+        s.running = running;
     }
 
     async fn update_queues(

@@ -204,7 +204,7 @@ async fn sender_handshake(stream: &mut TcpStream, cipher: &Cipher, token: &str) 
     )
     .await?;
     match recv_frame(stream, cipher).await? {
-        Frame::HelloAck { status, message } if status == "ok" => Ok(()),
+        Frame::HelloAck { status, message: _ } if status == "ok" => Ok(()),
         Frame::HelloAck { status, message } => {
             bail!("peer rejected sync auth ({}): {}", status, message.unwrap_or_default())
         }
@@ -255,7 +255,7 @@ async fn send_objects(
             cipher,
             &Frame::FileChunks {
                 path: path.clone(),
-                chunks,
+                chunks: chunks.clone(),
             },
         )
         .await?;

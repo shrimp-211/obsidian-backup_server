@@ -339,19 +339,47 @@ impl Default for AdaptiveSchedulerConfig {
     }
 }
 
+impl Default for AdaptiveThresholds {
+    fn default() -> Self {
+        Self {
+            tps_critical: default_tps_critical(),
+            tps_danger: default_tps_danger(),
+            host_memory_cap_mb: default_memory_cap(),
+        }
+    }
+}
+
+impl Default for ErasureCodingConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for PackfileConfig {
+    fn default() -> Self {
+        Self {
+            adaptive_sizing: true,
+            max_packfile_size_mb: default_max_packfile_size(),
+            enable_crc32c_footer: true,
+        }
+    }
+}
+
+impl Default for RocksDbReliability {
+    fn default() -> Self {
+        Self {
+            checkpoint_interval_minutes: default_checkpoint_interval(),
+            auto_rebuild_from_pack: true,
+        }
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            packfile: PackfileConfig {
-                adaptive_sizing: true,
-                max_packfile_size_mb: default_max_packfile_size(),
-                enable_crc32c_footer: true,
-            },
-            rocksdb_reliability: RocksDbReliability {
-                checkpoint_interval_minutes: default_checkpoint_interval(),
-                auto_rebuild_from_pack: true,
-            },
-            erasure_coding: ErasureCodingConfig { enabled: true },
+            packfile: PackfileConfig::default(),
+            rocksdb_reliability: RocksDbReliability::default(),
+            erasure_coding: ErasureCodingConfig::default(),
         }
     }
 }
@@ -392,7 +420,8 @@ mod glob_match {
     pub fn glob_match(pattern: &str, path: &str) -> bool {
         let pattern = pattern.replace("**", "___DOUBLESTAR___");
         let segments: Vec<&str> = pattern.split('/').collect();
-        let path_segments: Vec<&str> = path.replace('\\', "/").split('/').collect();
+        let normalized = path.replace('\\', "/");
+        let path_segments: Vec<&str> = normalized.split('/').collect();
 
         match_segments(&segments, &path_segments, 0, 0)
     }

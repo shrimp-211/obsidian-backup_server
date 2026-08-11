@@ -175,7 +175,7 @@ impl ObjectStore {
                                 hash,
                                 ObjectLocation::Sharded {
                                     dir: path,
-                                    size: original_size as usize,
+                                    size: original_size,
                                 },
                             );
                         }
@@ -323,7 +323,7 @@ impl ObjectStore {
             hash.to_string(),
             ObjectLocation::Sharded {
                 dir,
-                size: enc.original_size,
+                size: enc.original_size as u64,
             },
         );
 
@@ -622,7 +622,7 @@ impl PackfileWriter {
         let size = data.len() as u64;
 
         self.file.write_all(data)?;
-        self.crc = crc32c::crc32c_append(&mut self.crc, data);
+        self.crc = crc32c::crc32c_append(self.crc, data);
         self.bytes_written += size;
 
         self.index.push(PackfileEntry {

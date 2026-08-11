@@ -96,9 +96,7 @@ pub fn verify_signature(data: &[u8], signature_b64: &str, public_key: &[u8]) -> 
     let Ok(sig_arr): Result<[u8; SIGNATURE_SIZE], _> = sig_bytes.as_slice().try_into() else {
         return false;
     };
-    let Ok(sig) = Signature::from_bytes(&sig_arr) else {
-        return false;
-    };
+    let sig = Signature::from_bytes(&sig_arr);
     let Ok(vk_arr): Result<[u8; KEY_SIZE], _> = public_key.try_into() else {
         return false;
     };

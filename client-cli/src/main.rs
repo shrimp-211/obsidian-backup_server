@@ -29,7 +29,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Obsidian Backup CLI — Enterprise Minecraft backup management.

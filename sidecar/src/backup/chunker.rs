@@ -11,7 +11,6 @@
 
 use std::io::Read;
 
-use blake3::Hasher;
 use tracing::debug;
 
 /// Represents a single data chunk produced by the chunking engine.

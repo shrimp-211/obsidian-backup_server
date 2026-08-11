@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::backup::BackupEngine;
 use crate::config::SidecarConfig;
