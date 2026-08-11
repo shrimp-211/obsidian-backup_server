@@ -33,8 +33,11 @@ jobs:
         run: cargo build
         working-directory: ${{ matrix.package }}
 
+      # Unit tests only — integration_test.rs links the huge RocksDB lib and
+      # takes 60+ min on GitHub's 2-core runners; run it locally for the
+      # full backup→restore cycle.
       - name: Test ${{ matrix.package }}
-        run: cargo test
+        run: cargo test --lib --no-fail-fast
         working-directory: ${{ matrix.package }}
 
       - name: Clippy ${{ matrix.package }}
