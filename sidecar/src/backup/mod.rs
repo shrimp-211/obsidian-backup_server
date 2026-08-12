@@ -1270,6 +1270,80 @@ impl BackupEngine {
     }
 
     // =========================================================================
+    // Prune (snapshot retention / GC)
+    // =========================================================================
+
+    /// Prune old snapshots, keeping the most recent `keep` (excluding pinned).
+    ///
+    /// Releases the chunk references of removed snapshots and deletes their
+    /// manifest/signature metadata. Object files are left for the GC to sweep.
+    pub async fn prune_snapshots(&self, keep: usize) -> Result<u64> {
+        let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
+
+        let snaps = {
+            let s = self.snapshots.read().await;
+            let mut v = s.clone();
+            v.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)); // newest first
+            v
+        };
+
+        let mut removed = 0u64;
+        let mut kept = 0u64;
+        for snap in &snaps {
+            let pin_path = snapshot_dir.join(format!("{}.pin", snap.snapshot_id));
+            if pin_path.exists() {
+                continue; // WORM-pinned snapshots are never pruned
+            }
+            if kept < keep as u64 {
+                kept += 1;
+                continue;
+            }
+            match self.delete_snapshot(&snap.snapshot_id).await {
+                Ok(()) => removed += 1,
+                Err(e) => warn!(
+                    "[Prune] Failed to delete snapshot {}: {}",
+                    snap.snapshot_id, e
+                ),
+            }
+        }
+
+        self.load_snapshots().await?;
+        info!("[Prune] Removed {} old snapshots (kept {})", removed, keep);
+        Ok(removed)
+    }
+
+    /// Delete a single snapshot: release chunk refs and remove metadata files.
+    async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
+
+        let files = {
+            let index = self.block_index.lock().await;
+            index.get_snapshot_files(snapshot_id)?
+        };
+
+        let index = self.block_index.lock().await;
+        for file in &files {
+            for chunk in index.get_file_chunks(file)? {
+                let _ = index.decrement_ref(&chunk);
+            }
+        }
+        index.delete_snapshot_files(snapshot_id)?;
+        drop(index);
+
+        let manifest = snapshot_dir.join(format!("{}.json", snapshot_id));
+        if manifest.exists() {
+            std::fs::remove_file(&manifest)?;
+        }
+        for suffix in ["sig", "pin"] {
+            let p = snapshot_dir.join(format!("{}.{}", snapshot_id, suffix));
+            let _ = std::fs::remove_file(p);
+        }
+
+        info!("[Prune] Deleted snapshot {}", snapshot_id);
+        Ok(())
+    }
+
+    // =========================================================================
     // Cancel
     // =========================================================================
 

@@ -194,6 +194,7 @@ async fn dispatch(engine: &Arc<BackupEngine>, config: &SidecarConfig, request: V
         "rollback" => handle_rollback(engine, tx_id, params).await,
         "verify" => handle_verify(engine, tx_id, params).await,
         "pin" => handle_pin(engine, tx_id, params).await,
+        "prune" => handle_prune(engine, tx_id, params).await,
         "cancel" => handle_cancel(engine, tx_id).await,
         "forecast" => handle_forecast(engine, tx_id).await,
         "export" => handle_export(engine, tx_id, params).await,
@@ -552,6 +553,26 @@ async fn handle_pin(engine: &Arc<BackupEngine>, tx_id: &str, params: Value) -> V
             "tx_id": tx_id,
             "status": "error",
             "message": format!("Pin failed: {}", e)
+        }),
+    }
+}
+
+async fn handle_prune(engine: &Arc<BackupEngine>, tx_id: &str, params: Value) -> Value {
+    let keep = params
+        .get("keep")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10) as usize;
+
+    match engine.prune_snapshots(keep).await {
+        Ok(removed) => json!({
+            "tx_id": tx_id,
+            "status": "ok",
+            "data": { "removed": removed, "keep": keep }
+        }),
+        Err(e) => json!({
+            "tx_id": tx_id,
+            "status": "error",
+            "message": format!("Prune failed: {}", e)
         }),
     }
 }

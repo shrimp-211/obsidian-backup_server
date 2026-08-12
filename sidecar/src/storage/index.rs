@@ -337,6 +337,16 @@ impl BlockIndex {
         Ok(())
     }
 
+    /// Remove the file list recorded for a snapshot (used when pruning).
+    pub fn delete_snapshot_files(&self, snapshot_id: &str) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_SNAPSHOT)
+            .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_SNAPSHOT))?;
+        self.db.delete_cf(&cf, snapshot_id.as_bytes())?;
+        Ok(())
+    }
+
     /// Get all snapshot IDs from the index.
     pub fn get_all_snapshot_ids(&self) -> Result<Vec<String>> {
         let cf = self

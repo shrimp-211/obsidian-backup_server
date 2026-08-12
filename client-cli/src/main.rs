@@ -156,6 +156,13 @@ enum Commands {
         /// Path to .tar.zst archive
         path: String,
     },
+
+    /// Prune old snapshots (retention policy — keeps the most recent N)
+    Prune {
+        /// Number of most recent snapshots to keep
+        #[arg(long, default_value = "10")]
+        keep: usize,
+    },
 }
 
 #[tokio::main]
@@ -284,6 +291,7 @@ fn build_request(cmd: &Commands) -> Result<(String, Value)> {
             "remote_sync".into(),
             json!({ "action": action, "snapshot_id": snapshot_id }),
         )),
+        Commands::Prune { keep } => Ok(("prune".into(), json!({ "keep": keep }))),
     }
 }
 
@@ -411,6 +419,14 @@ fn display_response(cmd: &Commands, response: &Value) {
                 println!("{} Storage Forecast:", "───".cyan().bold());
                 println!("  Capacity: {:.1} GB  |  Growth: {:.1} MB/day  |  Remaining: {:.1} days",
                     capacity, growth, days);
+            }
+        }
+
+        Commands::Prune { .. } => {
+            if let Some(d) = data {
+                let removed = d.get("removed").and_then(|v| v.as_u64()).unwrap_or(0);
+                let keep = d.get("keep").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("{} Pruned {} snapshots (kept {})", "✓".green().bold(), removed, keep);
             }
         }
 
