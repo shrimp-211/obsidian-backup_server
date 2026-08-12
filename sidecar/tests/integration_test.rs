@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 struct TestHarness {
     engine: Arc<BackupEngine>,
     _temp: TempDir,
-    world_dir: PathBuf,
+    _world_dir: PathBuf,
 }
 
 async fn setup_test_harness() -> TestHarness {
@@ -60,7 +60,7 @@ async fn setup_test_harness() -> TestHarness {
     TestHarness {
         engine,
         _temp: temp,
-        world_dir,
+        _world_dir: world_dir,
     }
 }
 

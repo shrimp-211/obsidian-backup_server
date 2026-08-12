@@ -248,10 +248,10 @@ impl BackupEngine {
         for entry in std::fs::read_dir(&snapshot_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json")
+            if path.extension().is_some_and(|e| e == "json")
                 && !path
                     .file_name()
-                    .map_or(false, |n| n.to_string_lossy().ends_with(".pin"))
+                    .is_some_and(|n| n.to_string_lossy().ends_with(".pin"))
             {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -354,7 +354,7 @@ impl BackupEngine {
                 let active = self.active_transaction.lock().await;
                 if active
                     .as_ref()
-                    .map_or(false, |t| t.state == TransactionState::Aborted)
+                    .is_some_and(|t| t.state == TransactionState::Aborted)
                 {
                     warn!("[Backup:{}] Transaction aborted", tx_id_short);
                     break;
@@ -426,7 +426,7 @@ impl BackupEngine {
                             } else {
                                 transients.push(transaction::TransientObject {
                                     chunk_hash: chunk.hash.clone(),
-                                    object_path: format!(".obsidian/store/objects/{}", &chunk.hash),
+                                    object_path: format!(".obsidian/store/objects/{}", chunk.hash),
                                 });
                                 if let Err(e) = index.insert_chunk(
                                     &chunk.hash,
@@ -729,7 +729,7 @@ impl BackupEngine {
                 return Err(anyhow::anyhow!("Invalid chunk coordinate: {}", coord));
             }
 
-            let region_path = format!("region/r.{}.mca", coord.replace(':', ".").replace(',', "."));
+            let region_path = format!("region/r.{}.mca", coord.replace([':', ','], "."));
             let dest = validate_safe_path(&sandbox_tx, &region_path)?;
 
             let chunks = block_index.get_file_chunks(&region_path)?;
@@ -1051,16 +1051,13 @@ impl BackupEngine {
         let target_time = Utc::now() - chrono::Duration::seconds(seconds as i64);
 
         let snaps = self.snapshots.read().await;
-        let target_snap = snaps
-            .iter()
-            .filter(|s| {
-                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&s.timestamp) {
-                    ts < target_time
-                } else {
-                    false
-                }
-            })
-            .last();
+        let target_snap = snaps.iter().rfind(|s| {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&s.timestamp) {
+                ts < target_time
+            } else {
+                false
+            }
+        });
 
         match target_snap {
             Some(snap) => {

@@ -134,7 +134,7 @@ impl BlockIndex {
         let current_refs = self.get_ref_count(chunk_hash)?;
         let new_refs = current_refs + 1;
         self.db
-            .put_cf(&ref_cf, chunk_hash.as_bytes(), &new_refs.to_le_bytes())?;
+            .put_cf(&ref_cf, chunk_hash.as_bytes(), new_refs.to_le_bytes())?;
 
         // Store chunk metadata
         let meta_cf = self
@@ -174,7 +174,7 @@ impl BlockIndex {
             .cf_handle(CF_CHUNK_REFS)
             .ok_or_else(|| anyhow::anyhow!("CF {} not found", CF_CHUNK_REFS))?;
         self.db
-            .put_cf(&cf, chunk_hash.as_bytes(), &count.to_le_bytes())?;
+            .put_cf(&cf, chunk_hash.as_bytes(), count.to_le_bytes())?;
         Ok(())
     }
 
@@ -237,7 +237,7 @@ impl BlockIndex {
         }
 
         // Sort by size descending
-        files_with_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+        files_with_sizes.sort_by_key(|x| std::cmp::Reverse(x.1));
         files_with_sizes.truncate(limit);
 
         Ok(files_with_sizes)
@@ -293,7 +293,7 @@ impl BlockIndex {
         let new = current.saturating_sub(1);
         if new > 0 {
             self.db
-                .put_cf(&cf, chunk_hash.as_bytes(), &new.to_le_bytes())?;
+                .put_cf(&cf, chunk_hash.as_bytes(), new.to_le_bytes())?;
         } else {
             self.db.delete_cf(&cf, chunk_hash.as_bytes())?;
         }

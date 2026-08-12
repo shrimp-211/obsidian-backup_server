@@ -152,7 +152,7 @@ impl FileScanner {
             let size = metadata.len();
             let modified = metadata
                 .modified()
-                .map(|t| to_unix_timestamp(t))
+                .map(to_unix_timestamp)
                 .unwrap_or(0);
 
             // For incremental mode: skip unchanged files

@@ -36,6 +36,9 @@ pub struct EncodedObject {
     pub original_size: usize,
 }
 
+/// Reconstructed shard groups: `(data_shards, parity_shards)`.
+pub type ShardGroup = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 impl ErasureCodec {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -89,7 +92,7 @@ impl ErasureCodec {
         data_shards: Vec<Option<Vec<u8>>>,
         parity_shards: Vec<Option<Vec<u8>>>,
         shard_size: usize,
-    ) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    ) -> Result<ShardGroup> {
         let missing = data_shards
             .iter()
             .chain(&parity_shards)

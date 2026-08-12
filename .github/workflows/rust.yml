@@ -46,5 +46,5 @@ jobs:
         working-directory: ${{ matrix.package }}
 
       - name: Clippy ${{ matrix.package }}
-        run: cargo clippy --lib --bins -- -D warnings
+        run: cargo clippy ${{ matrix.package == 'sidecar' && '--lib --bins' || '--bins' }} -- -D warnings
         working-directory: ${{ matrix.package }}

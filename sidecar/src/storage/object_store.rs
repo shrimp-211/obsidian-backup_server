@@ -165,7 +165,7 @@ impl ObjectStore {
                     let parity_path = self.parity_dir.join(&hash);
                     match read_parity_header(&parity_path) {
                         Ok((original_size, shard_size)) => {
-                            let stored = (DATA_SHARDS + PARITY_SHARDS) as u64 * shard_size as u64
+                            let stored = (DATA_SHARDS + PARITY_SHARDS) as u64 * shard_size
                                 + PARITY_HEADER_LEN as u64;
                             self.total_bytes += stored;
                             self.total_raw_bytes += original_size;
@@ -439,10 +439,10 @@ impl ObjectStore {
         // Read all 10 shards and check each against its expected hash.
         let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(TOTAL_SHARDS);
         let mut corrupted = 0usize;
-        for i in 0..DATA_SHARDS {
+        for (i, exp) in expected[..DATA_SHARDS].iter().enumerate() {
             let path = dir.join(format!("d{}", i));
             match fs::read(&path) {
-                Ok(bytes) if blake3::hash(&bytes).as_bytes() == &expected[i] => {
+                Ok(bytes) if blake3::hash(&bytes).as_bytes() == exp => {
                     shards.push(Some(bytes))
                 }
                 _ => {
@@ -597,7 +597,7 @@ impl ObjectStore {
 impl PackfileWriter {
     /// Open a new packfile for writing.
     pub fn new(packfile_dir: &Path, pack_id: String, max_size_mb: u64) -> Result<Self> {
-        let pack_path = packfile_dir.join(format!("{}.pack", &pack_id));
+        let pack_path = packfile_dir.join(format!("{}.pack", pack_id));
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
