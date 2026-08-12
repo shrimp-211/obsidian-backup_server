@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Connect to Sidecar (UDS on Unix, Named Pipe on Windows)
-    let stream = connect_ipc(&cli.socket).await
+    let stream = connect_ipc(cli.socket.as_path()).await
         .with_context(|| format!("Cannot connect to Sidecar at {:?}. Is the daemon running?",
             cli.socket))?;
 
@@ -456,13 +456,13 @@ enum IpcStream {
 
 /// Connect to the Sidecar IPC endpoint.
 #[cfg(unix)]
-async fn connect_ipc(addr: &PathBuf) -> io::Result<IpcStream> {
+async fn connect_ipc(addr: &std::path::Path) -> io::Result<IpcStream> {
     Ok(IpcStream::Unix(tokio::net::UnixStream::connect(addr).await?))
 }
 
 /// Connect to the Sidecar IPC endpoint.
 #[cfg(windows)]
-async fn connect_ipc(addr: &PathBuf) -> io::Result<IpcStream> {
+async fn connect_ipc(addr: &std::path::Path) -> io::Result<IpcStream> {
     let sanitized: String = addr
         .to_string_lossy()
         .chars()
