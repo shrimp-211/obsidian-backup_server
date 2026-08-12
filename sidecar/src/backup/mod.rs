@@ -492,7 +492,7 @@ impl BackupEngine {
             let active = self.active_transaction.lock().await;
             active
                 .as_ref()
-                .map_or(false, |t| t.state == TransactionState::Aborted)
+                .is_some_and(|t| t.state == TransactionState::Aborted)
         };
         if was_aborted {
             self.tx_manager.rollback(&tx).await?;
