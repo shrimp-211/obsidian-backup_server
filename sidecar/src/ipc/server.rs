@@ -1,7 +1,8 @@
-//! Unix Domain Socket IPC server.
+//! Cross-platform IPC server.
 //!
-//! Listens on a UDS socket for JSON-encoded requests from the Minecraft mod
-//! and dispatches them to the backup engine. Supports:
+//! Listens on a UDS socket (Unix) or Named Pipe (Windows) for JSON-encoded
+//! requests from the Minecraft mod and dispatches them to the backup engine.
+//! Supports:
 //!   - Request/response pattern with transaction IDs
 //!   - Progress streaming for long-running operations
 //!   - Concurrent connections from mod + CLI client
@@ -12,11 +13,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
 use crate::backup::BackupEngine;
 use crate::config::SidecarConfig;
+use crate::ipc::transport::{IpcListener, IpcStream};
 
 /// IPC message handler dispatching requests to the backup engine.
 pub struct IpcServer {
@@ -36,13 +37,14 @@ impl IpcServer {
 
     /// Run the IPC server loop. Blocks until the listener is closed.
     pub async fn run(&self) -> Result<()> {
-        let listener = UnixListener::bind(&self.socket_path)?;
         info!("[IPC] Listening on {:?}", self.socket_path);
+        let addr = self.socket_path.to_string_lossy().to_string();
+        let listener = IpcListener::bind(&addr).await?;
 
         loop {
             match listener.accept().await {
-                Ok((stream, peer_addr)) => {
-                    debug!("[IPC] New connection from {:?}", peer_addr);
+                Ok(stream) => {
+                    debug!("[IPC] New connection accepted");
                     let engine = self.engine.clone();
                     let config = self.config.clone();
                     tokio::spawn(async move {
@@ -68,11 +70,11 @@ impl IpcServer {
 /// with a valid shared token. All subsequent messages are rejected
 /// until authentication succeeds.
 async fn handle_connection(
-    stream: UnixStream,
+    stream: IpcStream,
     engine: Arc<BackupEngine>,
     config: SidecarConfig,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
     // Read auth message

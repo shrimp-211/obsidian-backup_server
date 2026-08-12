@@ -19,7 +19,10 @@
 //!   obsidian pin <snapshot_id> --days <n>
 //!   obsidian forecast
 
+use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,8 +30,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use uuid::Uuid;
 
 /// Obsidian Backup CLI — Enterprise Minecraft backup management.
@@ -174,12 +176,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Connect to Sidecar
-    let stream = UnixStream::connect(&cli.socket).await
+    // Connect to Sidecar (UDS on Unix, Named Pipe on Windows)
+    let stream = connect_ipc(&cli.socket).await
         .with_context(|| format!("Cannot connect to Sidecar at {:?}. Is the daemon running?",
             cli.socket))?;
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
     // Build request
@@ -436,6 +438,85 @@ fn display_response(cmd: &Commands, response: &Value) {
             } else {
                 println!("{}", serde_json::to_string_pretty(response).unwrap_or_default());
             }
+        }
+    }
+}
+
+// =========================================================================
+// Cross-platform IPC transport (UDS on Unix, Named Pipe on Windows)
+// =========================================================================
+
+/// A bidirectional IPC stream.
+enum IpcStream {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    Pipe(tokio::net::windows::named_pipe::NamedPipeClient),
+}
+
+/// Connect to the Sidecar IPC endpoint.
+#[cfg(unix)]
+async fn connect_ipc(addr: &PathBuf) -> io::Result<IpcStream> {
+    Ok(IpcStream::Unix(tokio::net::UnixStream::connect(addr).await?))
+}
+
+/// Connect to the Sidecar IPC endpoint.
+#[cfg(windows)]
+async fn connect_ipc(addr: &PathBuf) -> io::Result<IpcStream> {
+    let sanitized: String = addr
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let pipe_name = format!(r"\.\pipe\{}", sanitized);
+    let client = tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name)?;
+    Ok(IpcStream::Pipe(client))
+}
+
+impl AsyncRead for IpcStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            #[cfg(unix)]
+            IpcStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            IpcStream::Pipe(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for IpcStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            #[cfg(unix)]
+            IpcStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            IpcStream::Pipe(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            #[cfg(unix)]
+            IpcStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            IpcStream::Pipe(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            #[cfg(unix)]
+            IpcStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            IpcStream::Pipe(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
