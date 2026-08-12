@@ -1277,6 +1277,12 @@ impl BackupEngine {
     ///
     /// Releases the chunk references of removed snapshots and deletes their
     /// manifest/signature metadata. Object files are left for the GC to sweep.
+    ///
+    /// NOTE: reference counting here is approximate. The `file_chunks` column
+    /// family stores only the latest file→chunk mapping (it is overwritten on
+    /// each backup), so decrementing refs for an *old* snapshot may under-count
+    /// chunks that have since been replaced. Object-level refcounting with a
+    /// per-snapshot chunk table is a future refinement.
     pub async fn prune_snapshots(&self, keep: usize) -> Result<u64> {
         let snapshot_dir = self.server_root.join(".obsidian/store/snapshots");
 

@@ -1,0 +1,11 @@
+# GNU toolchain on Windows (MinGW via MSYS2 UCRT64).
+#
+# rocksdb 8.10 (librocksdb-sys) has a missing `#include <cstdint>` in
+# transaction_db_mutex.h that gcc 16 (stricter header deps) exposes. Work
+# around it without patching the vendored dependency by force-including
+# <cstdint> into every C++ translation unit.
+[target.x86_64-pc-windows-gnu]
+linker = "gcc"
+
+[env]
+CXXFLAGS = "-include cstdint"
