@@ -168,6 +168,12 @@ pub struct StorageConfig {
 
     #[serde(default)]
     pub erasure_coding: ErasureCodingConfig,
+
+    /// Number of files processed concurrently during a backup transaction.
+    /// Lower on weak CPUs to protect TPS; raise on strong machines for
+    /// higher backup throughput.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
 }
 
 /// Reed-Solomon (8+2) object-level erasure coding.
@@ -212,6 +218,9 @@ pub struct ExclusionRules {
 
 fn default_true() -> bool {
     true
+}
+fn default_concurrency() -> usize {
+    4
 }
 fn default_dial_timeout() -> u64 {
     30
@@ -380,6 +389,7 @@ impl Default for StorageConfig {
             packfile: PackfileConfig::default(),
             rocksdb_reliability: RocksDbReliability::default(),
             erasure_coding: ErasureCodingConfig::default(),
+            concurrency: default_concurrency(),
         }
     }
 }

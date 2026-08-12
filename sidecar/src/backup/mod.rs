@@ -22,7 +22,6 @@ use self::chunker::{Chunk, ChunkEngine};
 use self::scanner::FileScanner;
 use self::transaction::{Transaction, TransactionManager, TransactionState};
 
-const MAX_CONCURRENT_FILES: usize = 4;
 
 /// Validates that a user-supplied path does not escape the sandbox directory.
 fn validate_safe_path(base: &Path, user_path: &str) -> Result<PathBuf> {
@@ -346,7 +345,7 @@ impl BackupEngine {
         self.update_queues(0, 1, 0, 0, 0).await;
 
         // Phase: CHUNK + DEDUP (parallelized with semaphore)
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILES));
+        let semaphore = Arc::new(Semaphore::new(self.config.storage.concurrency));
         let mut handles = Vec::new();
 
         for file_entry in files.iter() {

@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [master, main, develop]
 
+# Cancel superseded runs — RocksDB compiles are expensive on 2-core runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     name: Rust ${{ matrix.package }}
