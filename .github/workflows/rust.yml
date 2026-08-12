@@ -13,11 +13,12 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust ${{ matrix.package }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} ${{ matrix.package }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         package: [sidecar, client-cli]
     steps:
       - uses: actions/checkout@v4
