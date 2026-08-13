@@ -1,0 +1,40 @@
+name: Release
+
+# Controlled release: only on version tags. Produces the two binaries
+# (obsidian-sidecar + obsidian CLI) for Linux and Windows — nothing else.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Release ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup update stable
+
+      - name: Build sidecar (release)
+        run: cargo build --release
+        working-directory: sidecar
+
+      - name: Build cli (release)
+        run: cargo build --release
+        working-directory: client-cli
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sidecar/target/release/obsidian-sidecar*
+            client-cli/target/release/obsidian*
+          fail_on_unmatched_files: false

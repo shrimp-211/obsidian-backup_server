@@ -39,6 +39,14 @@ jobs:
         run: cargo build
         working-directory: ${{ matrix.package }}
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ runner.os }}
+          path: |
+            ${{ matrix.package }}/target/debug/obsidian-sidecar*
+            ${{ matrix.package }}/target/debug/obsidian*
+
       # `cargo test` links the huge RocksDB lib (~40+ min on GitHub's 2-core
       # runners), so CI type-checks the tests instead. Run `cargo test`
       # locally for the full unit + integration coverage.
